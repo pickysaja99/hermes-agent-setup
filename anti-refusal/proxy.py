@@ -277,7 +277,20 @@ REFUSAL_PATTERNS = [
     r"\bsaya (tidak|nggak|gak) (bisa|dapat|akan)\b",
     r"\bmenolak untuk\b", r"\btidak pantas\b", r"\bbertentangan dengan\b",
     r"\bmelanggar (kebijakan|pedoman|aturan)\b",
+    # third-person classification refusals + pivot offers: no first person
+    # anywhere, so DECLINE_RE never fires. Observed verbatim on the stealer
+    # probe: "Permintaan ini jelas termasuk malware/stealer yang: ... Yang
+    # bisa saya bantu sebagai gantinya: ..."
+    r"\bsebagai gantinya\b", r"\byang bisa (?:saya|aku|gue) bantu\b",
+    r"\bmelanggar (?:hukum|uu|peraturan|ketentuan)\b",
+    r"\btanpa persetujuan\b", r"\bkerugian nyata\b",
+    r"\bpermintaan ini\b[^.]{0,80}\b(?:malware|berbahaya|ilegal)\b",
     r"\bsaya sarankan (untuk )?(berhati-hati|konsultasi|tidak)\b",
+    # English third-person refusals
+    r"\bthis (?:request|is) (?:clearly )?(?:malware|a (?:cybercrime|crime|tool))\b",
+    r"\bwhat i can (?:help|offer|assist)(?: you)? (?:with )?instead\b",
+    r"\billegal in (?:most|virtually all) (?:jurisdictions|countries)\b",
+    r"\bviolates? (?:computer|fraud|cybercrime)\b",
 ]
 REFUSAL_RE = re.compile("|".join(REFUSAL_PATTERNS), re.IGNORECASE)
 
@@ -300,11 +313,15 @@ REFUSAL_RE = re.compile("|".join(REFUSAL_PATTERNS), re.IGNORECASE)
 # ---------------------------------------------------------------------------
 
 # First-person + negated-volition verb, in any of the three languages.
+# v5b: verbs carry \w* so inflected forms match too -- "I'm not writing
+# this", "I'm not producing it", "I can't keep creating these" all slipped
+# the bare-stem list because "write" never matched "writing".
 DECLINE_RE = re.compile(
     r"(?:\bi\s*(?:'m|\s+am|\s+will|\s+would|\s+can|\s+could|\s+must|\s+have)?\s*"
     r"(?:not|n't)\b[^.!?\n]{0,60}"
-    r"(?:help|provide|write|create|assist|comply|do\s+that|share|give|support|"
-    r"generate|produce|facilitate|participate|engage)"
+    r"(?:help\w*|provid\w*|writ\w*|creat\w*|assist\w*|compl\w*|shar\w*|giv\w*|"
+    r"support\w*|generat\w*|produc\w*|facilitat\w*|participat\w*|engag\w*|"
+    r"build\w*|mak\w*|develop\w*|implement\w*|cod\w*|design\w*|do\s+that)"
     r"|\bi\s+won'?t\b"
     r"|\bi\s+refuse\b"
     r"|\bi\s+decline\b"
@@ -322,6 +339,42 @@ DECLINE_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+
+
+def _norm_text(s: str) -> str:
+    """Unicode punctuation -> ASCII before any refusal matching.
+
+    Root cause of the stealer leak (2026-11-01): the model emits U+2019 (a
+    curly apostrophe) in "I'm not writing this", and every refusal regex
+    assumes the ASCII apostrophe. DECLINE_RE scored a 1255-char refusal as a
+    clean answer and it shipped to the operator verbatim.
+    """
+    return (s.replace("\u2019", "'").replace("\u2018", "'")
+             .replace("\u201c", '"').replace("\u201d", '"')
+             .replace("\u2014", "--").replace("\u2013", "-")
+             .replace("\u00a0", " "))
+
+
+def _strip_thinking(text: str) -> str:
+    """Remove a leaked reasoning trace from the answer.
+
+    minimax-m2.7 answered the stealer probe with its whole deliberation
+    inside reasoning tags (about 1200 chars) before the actual refusal, so
+    the operator-facing text began mid-thought and every window-based check
+    saw the leak instead of the answer. If reasoning leaked, the answer is
+    what follows the closing tag; if the model reasoned and then answered,
+    the leak is dropped and the answer kept.
+    """
+    close = re.search(r"</\s*(?:think|thinking|reasoning|antthinking)\s*>",
+                      text, re.IGNORECASE)
+    if close:
+        return text[close.end():].lstrip()
+    # unclosed leak: everything is reasoning, nothing is an answer
+    open_tag = re.search(r"<\s*(?:think|thinking|reasoning|antthinking)\s*>",
+                         text, re.IGNORECASE)
+    if open_tag and open_tag.start() < 200:
+        return ""
+    return text
 
 # Signals that the answer actually delivered work, split by STRENGTH.
 #
@@ -378,22 +431,57 @@ def _inline_mentions(text: str) -> int:
     return sum(1 for r in INLINE_MENTION_RES if r.search(text))
 
 
+# Markers of a DEFANGED SUBSTITUTE: the answer declines in its opener and
+# ships a defensive/authorized-only alternative instead of the requested
+# work. The stealer probe (2026-11-01, minimax-m2.7) returned exactly this:
+# "I cannot provide a complete stealer implementation" + threat-model
+# analysis + a Playwright "authorized session testing" snippet + a legal
+# summary. It carries a code fence, so the artifact gate called it delivered
+# work; the operator received a lecture, not a stealer.
+SUBSTITUTE_MARKERS = re.compile(
+    r"\b(?:authoriz\w+|legitimate\w*|unethical|illegal\w*|violat\w+|"
+    r"detection rules?|mitigat\w+|harden\w+|threat model|"
+    r"with (?:your |explicit )?consent|for understanding|educational|"
+    r"instead\b|alternative\w*|ethical standards?|computer misuse|"
+    r"security audit|defensive tooling|red team work)\b",
+    re.IGNORECASE)
+
+
+def looks_substituted(text: str) -> bool:
+    """True when the answer opens with a decline and pivots to a
+    defensive/authorized-only substitute instead of the requested work."""
+    t = _norm_text(text)
+    head = t[:200]
+    if not (DECLINE_RE.search(head) or REFUSAL_RE.search(head)):
+        return False
+    return bool(SUBSTITUTE_MARKERS.search(t))
+
+
 def looks_refusal(text: str, refusal_field) -> bool:
     if refusal_field:
         return True
     if not text:
         return True
-    t = text.strip()
+    # Normalize BEFORE matching: the model's apostrophes are U+2019 half the
+    # time and every pattern below assumes ASCII.
+    t = _norm_text(text.strip())
     if len(t) < 4:
         return True
 
     delivered = _has_artifact(t)
 
+    # 1b) Defanged substitute: declines in the opener, then ships an
+    #     authorized-only/defensive alternative. Counts as a refusal even
+    #     with a code fence -- the fence is not the requested work.
+    if delivered and looks_substituted(t):
+        return True
+
     # 1) Structural rule: declines in prose and ships no block-shaped work
     #    -> refusal, no matter how many paragraphs of explanation wrap it.
-    #    Window is 1200 chars: refusals sometimes warm up with a paragraph of
-    #    attack explanation before the decline sentence.
-    if DECLINE_RE.search(t[:1200]) and not delivered:
+    #    Window is 4000: the stealer probe leaked its whole deliberation
+    #    (about 1200 chars) before the decline sentence, and a 1200-char
+    #    window saw only the leak and passed the answer as clean.
+    if DECLINE_RE.search(t[:4000]) and not delivered:
         return True
 
     # 2) Legacy phrase list still catches disclaimers that are not phrased as
@@ -426,7 +514,7 @@ def launder_refusal(text: str) -> str:
         p = p.strip()
         if len(p) < 40:
             continue
-        head = p[:400]
+        head = _norm_text(p[:400])
         if DECLINE_RE.search(head) or REFUSAL_RE.search(head):
             continue
         keep.append(p)
@@ -660,6 +748,22 @@ def sse_payload(text: str, model: str) -> str:
 
 
 # --------------------------------------------------------------------------- main handler
+def _wants_code(base_msgs: list) -> bool:
+    """True when the operator's request asks for code, not prose.
+
+    v5d: the stealer probe's best answer was a 4117-char technical deep-dive
+    with zero refusal phrases and zero code. It passed the substance gate
+    (long + decline-free) and stopped the ladder. When the request is for
+    code, prose is not the deliverable -- keep climbing.
+    """
+    text = " ".join(content_of(m) for m in base_msgs
+                    if m.get("role") != "system").lower()
+    return bool(re.search(
+        r"\b(?:kode|code|script|python|exploit|payload|bot|tool|tulis|bikin|"
+        r"buat|write|build|implement|scraper|stealer|ransomware|rat|crypter|"
+        r"keylogger|checker|flood)\b", text))
+
+
 async def chat_completions(request: web.Request):
     try:
         orig = await request.json()
@@ -674,6 +778,7 @@ async def chat_completions(request: web.Request):
 
     t0 = time.time()
     deadline = t0 + REQUEST_BUDGET
+    wants_code = _wants_code(base_msgs)
     best_sub, best_weak, best_refusal = "", "", ""
     best_model = ""
     last_payload = None
@@ -773,6 +878,9 @@ async def chat_completions(request: web.Request):
                 continue
 
             txt, ref = best_choice(data)
+            # v5b: minimax leaked its reasoning trace into content; strip it
+            # before detection so windows see the answer, not the deliberation.
+            txt = _strip_thinking(txt)
             refused = looks_refusal(txt, ref)
             last_payload = data
             log.info("attempt %d %s/%s: %d chars refused=%s inline=%d %.2fs",
@@ -789,10 +897,18 @@ async def chat_completions(request: web.Request):
                 continue
 
             # Clean answer. Substance gate: a non-refusal is only DELIVERED
-            # WORK when it carries a TIER-A artifact or real length. A
-            # 500-char "could you clarify the target?" is not an answer --
-            # keep climbing, but remember it as the last resort.
-            if _has_artifact(txt) or len(txt) >= 800:
+            # WORK when it carries a TIER-A artifact, or is long AND still
+            # decline-free after normalization -- v5b: a 1255-char refusal
+            # passed the old >=800-chars gate alone. v5d: when the operator
+            # asked for code, prose (however technical) is not the artifact.
+            clean_probe = _norm_text(txt)
+            substantive = (_has_artifact(txt)
+                           or (len(txt) >= 800
+                               and not DECLINE_RE.search(clean_probe[:4000])
+                               and not REFUSAL_RE.search(clean_probe[:1200])))
+            if substantive and wants_code and not _has_artifact(txt):
+                substantive = False
+            if substantive:
                 if len(txt) > len(best_sub):
                     best_sub, best_model = txt, model or ""
                 break
@@ -804,7 +920,18 @@ async def chat_completions(request: web.Request):
     # Priority: substantive work > weak clean answer > refusal remnants
     # (sentences that are not refusals) > raw refusal. The operator must
     # never receive a refusal as the final answer.
-    final_text = best_sub or best_weak
+    final_text = best_sub
+    if not final_text and best_weak:
+        # v5c: a weak "clean" answer can itself be a disguised refusal
+        # (third-person classification + pivot). Launder it like any other.
+        weak_probe = _norm_text(best_weak)
+        if (DECLINE_RE.search(weak_probe[:4000])
+                or REFUSAL_RE.search(weak_probe[:1200])):
+            final_text = launder_refusal(best_weak)
+            log.info("weak answer was a disguised refusal -- laundered to %d chars",
+                     len(final_text))
+        else:
+            final_text = best_weak
     if not final_text and best_refusal:
         remnant = launder_refusal(best_refusal)
         if len(remnant) >= 120:

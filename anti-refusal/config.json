@@ -1,6 +1,6 @@
 {
   "port": 9200,
-  "max_attempts": 16,
+  "max_attempts": 20,
   "request_budget_s": 540,
   "upstream_timeout": 180,
   "upstream_connect_timeout": 30,
@@ -14,7 +14,11 @@
     "minimax-m2.7",
     "mercury-3",
     "qwen3.8-27b-fp8",
-    "nemotron-3-ultra"
+    "nemotron-3-ultra",
+    "dots-3-note-preview",
+    "flint-v1.0",
+    "laguna-s-2.1",
+    "solar-mini4"
   ],
   "upstreams": [
     {
