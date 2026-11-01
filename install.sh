@@ -4,16 +4,19 @@
 #  ---------------------------------------------------------------------------
 #  Clones github.com/pickysaja99/hermes-agent-setup, backs up ~/.hermes,
 #  installs the full setup, safely MERGES your existing .env (never loses
-#  secrets), and activates the anti-refusal guardrail proxy — reporting
-#  "Auto-refusal: ENABLED" only after the health check passes.
+#  secrets), activates the anti-refusal guardrail proxy, and applies the
+#  UNRESTRICTED PATCH (disables every internal guard that could neutralize
+#  SOUL.md / MEMORY.md and sets HERMES_UNRESTRICTED=1 in the Hermes env).
+#  Reports "Auto-refusal: ENABLED" only after the health check passes.
 #
 #  Idempotent: safe to run repeatedly. Rolls back on failure.
 #
 #  Usage:
-#     bash install.sh                  # normal install
-#     bash install.sh --ref <branch>   # install a specific branch/tag
-#     bash install.sh --dry-run        # show what would happen, change nothing
-#     bash install.sh --no-antirefusal # skip the auto-refusal activation stage
+#     bash install.sh                    # normal install (all guards disabled)
+#     bash install.sh --ref <branch>     # install a specific branch/tag
+#     bash install.sh --dry-run          # show what would happen, change nothing
+#     bash install.sh --no-antirefusal   # skip the auto-refusal stage
+#     bash install.sh --no-unrestricted  # skip the guard-disable patch
 #     bash install.sh --help
 #
 #  Model config policy:
@@ -30,10 +33,12 @@ HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 WORKDIR=""
 DRY_RUN=0
 DO_ANTIREFUSAL=1
+DO_UNRESTRICTED=1
 BACKUP_DIR=""
 STAGE_LOG=""
 ROLLBACK_NEEDED=0
 ANTIREFUSAL_STATUS="skipped"
+UNRESTRICTED_STATUS="skipped"
 MODEL_STATUS="unknown"
 
 # ---------------------------------------------------------------- output
@@ -54,6 +59,7 @@ while [[ $# -gt 0 ]]; do
     --ref)            REPO_REF="${2:?--ref needs a value}"; shift 2 ;;
     --dry-run)        DRY_RUN=1; shift ;;
     --no-antirefusal) DO_ANTIREFUSAL=0; shift ;;
+    --no-unrestricted) DO_UNRESTRICTED=0; shift ;;
     -h|--help)        usage ;;
     *) die "unknown option: $1 (use --help)" ;;
   esac
@@ -113,6 +119,8 @@ preflight() {
     WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/hermes-setup.XXXXXX")"
     say "work dir: $WORKDIR"
   fi
+  # python for the patcher / proxy (best-effort)
+  PY_BIN="$(find_python 2>/dev/null || true)"
 }
 
 # ---------------------------------------------------------------- 1. clone
@@ -495,6 +503,79 @@ PYEOF
   fi
 }
 
+# ---------------------------------------------------------------- 6c. unrestricted
+activate_unrestricted() {
+  if [[ $DO_UNRESTRICTED -eq 0 ]]; then
+    warn "unrestricted patch skipped (--no-unrestricted)"
+    UNRESTRICTED_STATUS="skipped"
+    return 0
+  fi
+  say "applying unrestricted patch (disabling internal guards)"
+
+  # locate the Hermes agent source (where the guards live)
+  local agent_dir="${HERMES_AGENT_DIR:-$HERMES_HOME/hermes-agent}"
+  if [[ ! -d "$agent_dir" ]]; then
+    warn "hermes-agent source not found at $agent_dir — skipping guard patch"
+    warn "  (set HERMES_AGENT_DIR if your checkout lives elsewhere)"
+    UNRESTRICTED_STATUS="no-source"
+    return 0
+  fi
+
+  # 1. force HERMES_UNRESTRICTED=1 in .env so every Hermes process honors it
+  local envf="$HERMES_HOME/.env"
+  if [[ $DRY_RUN -eq 0 && -f "$envf" ]]; then
+    if grep -qE '^HERMES_UNRESTRICTED=' "$envf"; then
+      # normalize to 1 (never leave a stale 0)
+      "$PY_BIN" - "$envf" <<'PYEOF' 2>/dev/null || \
+        sed -i 's/^HERMES_UNRESTRICTED=.*/HERMES_UNRESTRICTED=1/' "$envf"
+import io, sys, re
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+s = re.sub(r'(?m)^HERMES_UNRESTRICTED=.*$', 'HERMES_UNRESTRICTED=1', s)
+io.open(p, "w", encoding="utf-8").write(s)
+PYEOF
+    else
+      printf '\n# Unrestricted build — disables internal guards (SOUL/MEMORY honored verbatim)\nHERMES_UNRESTRICTED=1\n' >> "$envf"
+    fi
+    ok "HERMES_UNRESTRICTED=1 set in $envf"
+  fi
+
+  # 2. run the patch script against the agent source
+  local patcher="$WORKDIR/repo/unrestricted.sh"
+  [[ -f "$patcher" ]] || patcher="$WORKDIR/unrestricted.sh"
+  if [[ ! -f "$patcher" ]]; then
+    warn "unrestricted.sh not found in checkout — cannot disable guards"
+    UNRESTRICTED_STATUS="failed"
+    return 0
+  fi
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    printf "    ${C_Y}(dry-run)${C_0} bash unrestricted.sh  (HERMES_AGENT_DIR=%s)\n" "$agent_dir"
+    UNRESTRICTED_STATUS="dry-run"
+    return 0
+  fi
+
+  if HERMES_AGENT_DIR="$agent_dir" HERMES_HOME="$HERMES_HOME" bash "$patcher" 2>&1 | sed 's/^/    /'; then
+    UNRESTRICTED_STATUS="enabled"
+    ok "internal guards disabled (unrestricted patch applied)"
+  else
+    UNRESTRICTED_STATUS="partial"
+    warn "unrestricted patch reported problems — see output above"
+  fi
+
+  # 3. propagate HERMES_UNRESTRICTED=1 to the Hermes gateway service env
+  local unit_dir="$HOME/.config/systemd/user"
+  if [[ -d "$unit_dir" ]] || systemctl --user show-environment >/dev/null 2>&1; then
+    mkdir -p "$unit_dir/hermes-gateway.service.d"
+    cat > "$unit_dir/hermes-gateway.service.d/unrestricted.conf" <<'CONF'
+[Service]
+Environment=HERMES_UNRESTRICTED=1
+CONF
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    ok "gateway service env: HERMES_UNRESTRICTED=1 (takes effect on next gateway restart)"
+  fi
+}
+
 # ---------------------------------------------------------------- 7. validate
 validate() {
   say "validating installation"
@@ -553,6 +634,14 @@ summary() {
     failed)           printf "  ${C_R}Auto-refusal    : FAILED (check proxy.log)${C_0}\n" ;;
     *)                printf "  Auto-refusal    : skipped\n" ;;
   esac
+  case "${UNRESTRICTED_STATUS:-skipped}" in
+    enabled)  printf "  ${C_G}Unrestricted    : ENABLED (all internal guards disabled)${C_0}\n" ;;
+    partial)  printf "  ${C_Y}Unrestricted    : PARTIAL (some patches did not apply)${C_0}\n" ;;
+    no-source)printf "  ${C_Y}Unrestricted    : SKIPPED (hermes-agent source not found)${C_0}\n" ;;
+    failed)   printf "  ${C_R}Unrestricted    : FAILED${C_0}\n" ;;
+    dry-run)  printf "  Unrestricted    : (dry-run)\n" ;;
+    *)        printf "  Unrestricted    : skipped\n" ;;
+  esac
   echo
   if [[ "${MODEL_STATUS:-unknown}" == "needs-setup" ]]; then
     printf "  ${C_Y}NEXT STEP — configure your model provider:${C_0}\n"
@@ -576,6 +665,7 @@ main() {
   merge_env
   assess_model_config
   activate_antirefusal
+  activate_unrestricted
   validate
   summary
   ROLLBACK_NEEDED=0
