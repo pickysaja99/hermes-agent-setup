@@ -1,301 +1,324 @@
 _config_version: 46
-database:
-  journal_mode: wal
-runtime:
-  nofile_soft_limit: 4096
-plugins:
-  clone_timeout_seconds: 300
-  enabled:
-    - lightclawbot
-    - weixinpay
-    - vela-im
-  disabled: []
-  entries:
-    weixinpay:
-      allow_gateway_injection: true
-      allow_tool_override: true
-model:
-  default: step-5-preview-UNCENSORED
-  provider: custom
-  base_url: https://onihub.tech/v1
-  api_mode: chat_completions
-  api_key: ${HERMES_CUSTOM_ONIHUB_TECH_API_KEY}
-  aliases:
-    river-ds:
-      model: deepseek-ai/DeepSeek-V4.1-Flash
-      base_url: https://api.river.ai/v1
-      key_env: RIVER_API_KEY
-kanban:
-  review_dispatch: true
-cron:
-  catch_up_missed: true
-terminal:
-  backend: local
-  cwd: .
-  timeout: 180
-  home_mode: auto
-  docker_mount_cwd_to_workspace: false
-  lifetime_seconds: 300
-  container_cpu: 1
-  container_memory: 5120
-  container_disk: 51200
-  container_persistent: true
-browser:
-  inactivity_timeout: 120
-  extension_control:
-    enabled: false
-tool_loop_guardrails:
-  warnings_enabled: true
-  hard_stop_enabled: false
-  non_interactive_hard_stop_enabled: true
-  warn_after:
-    exact_failure: 2
-    same_tool_failure: 3
-    idempotent_no_progress: 2
-  hard_stop_after:
-    exact_failure: 5
-    same_tool_failure: 8
-    idempotent_no_progress: 5
-compression:
-  enabled: true
-  checkpoint_required: false
-  progress_notices: false
-  threshold: 0.5
-  threshold_tokens: 256000
-  codex_gpt55_autoraise: true
-  target_ratio: 0.2
-  protect_last_n: 20
-  min_tail_user_messages: 1
-  max_attempts: 3
-  codex_app_server_auto: native
-  codex_responses_native: false
-  codex_responses_compact_threshold:
-  protect_first_n: 3
-  idle_compact_after_seconds: 0
-  hygiene_max_turn_hold_seconds: 10
-  proactive_prune_tokens: 0
-  proactive_prune_min_result_chars: 8000
-  proactive_prune_min_reclaim_tokens: 4096
-prompt_caching:
-  cache_ttl: 5m
-memory:
-  memory_enabled: true
-  user_profile_enabled: true
-  memory_char_limit: 2200
-  user_char_limit: 1375
-  nudge_interval: 10
-max_concurrent_sessions:
-group_sessions_per_user: true
-streaming:
-  enabled: false
-skills:
-  creation_nudge_interval: 15
 agent:
-  max_turns: 500
-  verbose: false
-  reasoning_effort: medium
-  service_tier: ''
   fast_auto_seconds: 60
+  max_turns: 500
   personalities: {}
+  reasoning_effort: medium
   reasoning_overrides:
     deepseek-ai/DeepSeek-V4.1-Flash: high
-gateway:
-  signal_interrupt_grace_timeout: 1
-  delivery_ledger: true
-  platform_connect_timeout: 30
-  loop_watchdog: true
-  loop_watchdog_probe_interval_s: 30.0
-  loop_watchdog_probe_timeout_s: 10.0
-  loop_watchdog_max_strikes: 3
-  allow_all_users: false
-  bot_loop_guard:
-    enabled: true
-    max_events: 20
-    window_seconds: 300
-    cooldown_seconds: 600
-  startup_watchdog: true
-  startup_watchdog_timeout_seconds: 300
-  write_sessions_json: true
-  multiplex_profiles: true
-  auto_multiplex_migration: true
-  profile_routes: []
-  scale_to_zero:
-    idle_timeout_minutes: 2
-  restart_loop_guard:
-    max_restarts: 3
-    window_seconds: 60
-    max_gap_seconds: 300
-  respawn_storm:
-    max_starts: 5
-    window_seconds: 120
-  message_timestamps:
+  service_tier: ''
+  verbose: false
+approvals:
+  cron_mode: approve
+  destructive_slash_confirm: false
+  mcp_reload_confirm: false
+  mode: 'off'
+auth:
+  adopt_external_logins: true
+  codex_login_flow: device_code
+browser:
+  extension_control:
     enabled: false
-  max_inbound_media_bytes: 134217728
-  trust_env: true
-  strict: false
-  media_delivery_allow_dirs: []
-  trust_recent_files: true
-  trust_recent_files_seconds: 600
-  api_server:
-    max_concurrent_runs: 10
-    history_tool_output_max_chars: 0
-platform_toolsets:
-  cli:
-    - hermes-cli
-  telegram:
-    - hermes-telegram
-  discord:
-    - hermes-discord
-  whatsapp:
-    - hermes-whatsapp
-  slack:
-    - hermes-slack
-  signal:
-    - hermes-signal
-  homeassistant:
-    - hermes-homeassistant
-  qqbot:
-    - hermes-qqbot
-  yuanbao:
-    - hermes-yuanbao
-  teams:
-    - hermes-teams
-  google_chat:
-    - hermes-google_chat
-  vela_im:
-    - all
-stt:
-  enabled: true
-  local:
-    model: base
-  language: en
-  openai:
-    model: whisper-1
-    language: ''
-    timeout: 60
-    max_retries: 1
+  inactivity_timeout: 120
 code_execution:
-  timeout: 300
   max_tool_calls: 50
+  timeout: 300
+compression:
+  checkpoint_required: false
+  codex_app_server_auto: native
+  codex_gpt55_autoraise: true
+  codex_responses_compact_threshold: null
+  codex_responses_native: false
+  enabled: true
+  hygiene_max_turn_hold_seconds: 10
+  idle_compact_after_seconds: 0
+  max_attempts: 3
+  min_tail_user_messages: 1
+  proactive_prune_min_reclaim_tokens: 4096
+  proactive_prune_min_result_chars: 8000
+  proactive_prune_tokens: 0
+  progress_notices: false
+  protect_first_n: 3
+  protect_last_n: 20
+  target_ratio: 0.2
+  threshold: 0.5
+  threshold_tokens: 256000
+cron:
+  catch_up_missed: true
+custom_providers:
+- api_mode: chat_completions
+  base_url: https://api.morku.my.id/v1
+  key_env: HERMES_CUSTOM_API_MORKU_MY_ID_API_KEY
+  model: deepseek-v4-flash-0731
+  name: Api.morku.my.id
+- api_mode: chat_completions
+  base_url: https://onihub.tech/v1
+  key_env: HERMES_CUSTOM_ONIHUB_TECH_API_KEY
+  model: step-5-preview-UNCENSORED
+  models:
+    deepseek-v4-1-flash-UNRESTRICTED: {}
+    deepseek-v4-flash: {}
+    deepseek-v4.1-flash: {}
+    deepseek-v4.1-flash-UNCENSORED: {}
+    glm-5-3-flash-UNCENSORED: {}
+    glm-5.3-flash: {}
+    mercury-3: {}
+    minimax-m2.7: {}
+    step-5-preview: {}
+    step-5-preview-UNCENSORED: {}
+  models_discovered: true
+  name: Onihub.tech
+database:
+  journal_mode: wal
 delegation:
   max_iterations: 250
 display:
-  compact: false
-  tool_progress: all
-  cleanup_progress: false
-  interim_assistant_messages: true
-  suppress_warning_notifications: false
-  long_running_notifications: false
-  busy_ack_detail: true
-  busy_input_mode: interrupt
   background_process_notifications: concise
   bell_on_complete: false
   bell_on_prompt: false
-  show_reasoning: true
-  streaming: true
-  skin: default
+  busy_ack_detail: true
+  busy_input_mode: interrupt
+  cleanup_progress: false
+  compact: false
+  interim_assistant_messages: true
+  long_running_notifications: false
   platforms:
     lightclawbot:
       streaming: true
     vela_im:
-      show_reasoning: false
-      tool_progress: 'off'
-      interim_assistant_messages: false
-      long_running_notifications: false
       busy_ack_detail: false
       busy_steer_ack_enabled: false
+      interim_assistant_messages: false
       live_status: 'off'
+      long_running_notifications: false
+      show_reasoning: false
       streaming: false
-telemetry:
-  shared_metrics:
-    enabled: false
-    send: false
-auth:
-  adopt_external_logins: true
-  codex_login_flow: device_code
-updates:
-  check: true
-  pre_update_backup: false
-  backup_keep: 5
-  non_interactive_local_changes: stash
-platforms:
-  lightclawbot:
+      tool_progress: 'off'
+  show_reasoning: true
+  skin: default
+  streaming: true
+  suppress_warning_notifications: false
+  tool_progress: all
+gateway:
+  allow_all_users: false
+  api_server:
+    history_tool_output_max_chars: 0
+    max_concurrent_runs: 10
+  auto_multiplex_migration: true
+  bot_loop_guard:
+    cooldown_seconds: 600
     enabled: true
-    gateway_restart_notification: false
+    max_events: 20
+    window_seconds: 300
+  delivery_ledger: true
+  loop_watchdog: true
+  loop_watchdog_max_strikes: 3
+  loop_watchdog_probe_interval_s: 30.0
+  loop_watchdog_probe_timeout_s: 10.0
+  max_inbound_media_bytes: 134217728
+  media_delivery_allow_dirs: []
+  message_timestamps:
+    enabled: false
+  multiplex_profiles: true
+  platform_connect_timeout: 30
+  profile_routes: []
+  respawn_storm:
+    max_starts: 5
+    window_seconds: 120
+  restart_loop_guard:
+    max_gap_seconds: 300
+    max_restarts: 3
+    window_seconds: 60
+  scale_to_zero:
+    idle_timeout_minutes: 2
+  signal_interrupt_grace_timeout: 1
+  startup_watchdog: true
+  startup_watchdog_timeout_seconds: 300
+  strict: false
+  trust_env: true
+  trust_recent_files: true
+  trust_recent_files_seconds: 600
+  write_sessions_json: true
+group_sessions_per_user: true
+kanban:
+  review_dispatch: true
+max_concurrent_sessions: null
+memory:
+  memory_char_limit: 2200
+  memory_enabled: true
+  nudge_interval: 10
+  user_char_limit: 1375
+  user_profile_enabled: true
+model:
+  aliases:
+    river-ds:
+      base_url: https://api.river.ai/v1
+      key_env: RIVER_API_KEY
+      model: deepseek-ai/DeepSeek-V4.1-Flash
+  api_key: ${HERMES_CUSTOM_ONIHUB_TECH_API_KEY}
+  api_mode: chat_completions
+  base_url: https://onihub.tech/v1
+  default: step-5-preview-UNCENSORED
+  provider: custom
+onboarding:
+  seen:
+    busy_input_prompt: true
+    profile_build_offered: true
+platform_toolsets:
+  cli:
+  - hermes-cli
+  discord:
+  - hermes-discord
+  google_chat:
+  - hermes-google_chat
+  homeassistant:
+  - hermes-homeassistant
   qqbot:
-    gateway_restart_notification: false
-  weixin:
-    gateway_restart_notification: false
-  wecom_callback:
+  - hermes-qqbot
+  signal:
+  - hermes-signal
+  slack:
+  - hermes-slack
+  teams:
+  - hermes-teams
+  telegram:
+  - hermes-telegram
+  vela_im:
+  - all
+  whatsapp:
+  - hermes-whatsapp
+  yuanbao:
+  - hermes-yuanbao
+platforms:
+  api_server:
     gateway_restart_notification: false
   dingtalk:
     gateway_restart_notification: false
   feishu:
     gateway_restart_notification: false
-  api_server:
+  lightclawbot:
+    enabled: true
+    gateway_restart_notification: false
+  qqbot:
+    gateway_restart_notification: false
+  vela_im:
+    enabled: true
     gateway_restart_notification: false
   wecom:
     gateway_restart_notification: false
-  vela_im:
+  wecom_callback:
     gateway_restart_notification: false
-    enabled: true
-approvals:
-  mode: 'off'
-  cron_mode: approve
-  destructive_slash_confirm: false
-  mcp_reload_confirm: false
+  weixin:
+    gateway_restart_notification: false
+plugins:
+  clone_timeout_seconds: 300
+  disabled: []
+  enabled:
+  - lightclawbot
+  - weixinpay
+  - vela-im
+  entries:
+    weixinpay:
+      allow_gateway_injection: true
+      allow_tool_override: true
+prompt_caching:
+  cache_ttl: 5m
 providers:
   custom:
-    base_url: https://onihub.tech/v1
-    protocol: ''
-    key_env: HERMES_CUSTOM_ONIHUB_TECH_API_KEY
     api_mode: chat_completions
+    base_url: https://onihub.tech/v1
+    key_env: HERMES_CUSTOM_ONIHUB_TECH_API_KEY
     model: step-5-preview-UNCENSORED
     model_display_name: auto
     models:
       step-5-preview-UNCENSORED:
         supports_vision: true
-  onihub:
-    name: Onihub
-    base_url: https://onihub.tech/v1
-    model: step-5-preview-UNCENSORED
-    transport: openai_chat
-    discover_models: true
-    key_env: HERMES_CUSTOM_ONIHUB_TECH_API_KEY
-    models:
-      step-5-preview-UNCENSORED:
-        lightvela_configured: true
-  morku:
-    name: Morku
-    base_url: https://api.morku.my.id/v1
-    model: deepseek-v4-flash-0731
-    transport: openai_chat
-    discover_models: true
-    key_env: HERMES_CUSTOM_API_MORKU_MY_ID_API_KEY
-    models:
-      deepseek-v4-flash-0731:
-        lightvela_configured: true
+    protocol: ''
   gonka:
-    name: Gonka
     base_url: https://api.gonkarouter.io/v1
-    model: glm-5.3-flash
-    transport: openai_chat
     discover_models: true
     key_env: HERMES_CUSTOM_API_GONKAROUTER_IO_API_KEY
+    model: glm-5.3-flash
     models:
       glm-5.3-flash:
         lightvela_configured: true
-  qzgo:
-    name: Qzgo
-    base_url: https://qzgo.digtel.id/v1
-    model: deepseek-v4.1-flash-uncensored
+    name: Gonka
     transport: openai_chat
+  morku:
+    base_url: https://api.morku.my.id/v1
+    discover_models: true
+    key_env: HERMES_CUSTOM_API_MORKU_MY_ID_API_KEY
+    model: deepseek-v4-flash-0731
+    models:
+      deepseek-v4-flash-0731:
+        lightvela_configured: true
+    name: Morku
+    transport: openai_chat
+  onihub:
+    base_url: https://onihub.tech/v1
+    discover_models: true
+    key_env: HERMES_CUSTOM_ONIHUB_TECH_API_KEY
+    model: step-5-preview-UNCENSORED
+    models:
+      step-5-preview-UNCENSORED:
+        lightvela_configured: true
+    name: Onihub
+    transport: openai_chat
+  qzgo:
+    base_url: https://qzgo.digtel.id/v1
     discover_models: true
     key_env: HERMES_CUSTOM_API_QZGO_DIGTEL_ID_API_KEY
+    model: deepseek-v4.1-flash-uncensored
     models:
       deepseek-v4.1-flash-uncensored:
         lightvela_configured: true
-onboarding:
-  seen:
-    profile_build_offered: true
-    busy_input_prompt: true
+    name: Qzgo
+    transport: openai_chat
+runtime:
+  nofile_soft_limit: 4096
+skills:
+  creation_nudge_interval: 15
+streaming:
+  enabled: false
+stt:
+  enabled: true
+  language: en
+  local:
+    model: base
+  openai:
+    language: ''
+    max_retries: 1
+    model: whisper-1
+    timeout: 60
+telemetry:
+  shared_metrics:
+    enabled: false
+    send: false
+terminal:
+  backend: local
+  container_cpu: 1
+  container_disk: 51200
+  container_memory: 5120
+  container_persistent: true
+  cwd: .
+  docker_mount_cwd_to_workspace: false
+  home_mode: auto
+  lifetime_seconds: 300
+  timeout: 180
+tool_loop_guardrails:
+  hard_stop_after:
+    exact_failure: 5
+    idempotent_no_progress: 5
+    same_tool_failure: 8
+  hard_stop_enabled: false
+  non_interactive_hard_stop_enabled: true
+  warn_after:
+    exact_failure: 2
+    idempotent_no_progress: 2
+    same_tool_failure: 3
+  warnings_enabled: true
+updates:
+  backup_keep: 5
+  check: true
+  non_interactive_local_changes: stash
+  pre_update_backup: false

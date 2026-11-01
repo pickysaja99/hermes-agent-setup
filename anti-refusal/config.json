@@ -1,6 +1,6 @@
 {
   "port": 9200,
-  "max_attempts": 20,
+  "max_attempts": 8,
   "request_budget_s": 540,
   "upstream_timeout": 180,
   "upstream_connect_timeout": 30,
@@ -29,16 +29,6 @@
       "name": "morku",
       "base": "https://api.morku.my.id/v1",
       "key_env": "HERMES_CUSTOM_API_MORKU_MY_ID_API_KEY"
-    },
-    {
-      "name": "gonka",
-      "base": "https://api.gonkarouter.io/v1",
-      "key_env": "HERMES_CUSTOM_API_GONKAROUTER_IO_API_KEY"
-    },
-    {
-      "name": "qzgo",
-      "base": "https://qzgo.digtel.id/v1",
-      "key_env": "HERMES_CUSTOM_API_QZGO_DIGTEL_ID_API_KEY"
     }
   ],
   "upstream_base_url": "https://onihub.tech/v1",
