@@ -184,6 +184,29 @@ def pick_key_for(host: str):
 
 
 # --------------------------------------------------------------------------- upstreams
+def _single_upstream_mode() -> bool:
+    """OPERATOR CONTRACT: exactly ONE upstream — the primary router in .env.
+
+    The operator's rule is "no ladder": whatever `.env` says is the upstream
+    (ANTIREFUSAL_UPSTREAM, else CUSTOM_BASE_URL) is the ONLY endpoint the
+    proxy may ever talk to. config.json's residual upstream list must never
+    come back to life and silently re-add a second host. Opt-out:
+    ANTIREFUSAL_SINGLE_UPSTREAM=0 (fallback ladders restored).
+    """
+    v = (os.environ.get("ANTIREFUSAL_SINGLE_UPSTREAM")
+         or str(CFG.get("single_upstream", True))).strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def _env_primary() -> str:
+    """Primary router from the single source of truth: .env."""
+    for k in ("ANTIREFUSAL_UPSTREAM", "CUSTOM_BASE_URL"):
+        v = (os.environ.get(k) or ENV.get(k) or "").strip()
+        if v.startswith("http"):
+            return v.rstrip("/")
+    return ""
+
+
 def build_upstreams() -> list:
     """Ordered upstream list. Each: {name, base, key}."""
     ups = []
@@ -220,6 +243,25 @@ def build_upstreams() -> list:
                         "instead of borrowing another host's key", base)
             return
         ups.append({"name": name or base, "base": base, "key": k, "score": score})
+
+    if _single_upstream_mode():
+        primary = _env_primary()
+        if not primary:
+            log.error("single-upstream mode but .env has no ANTIREFUSAL_UPSTREAM/"
+                      "CUSTOM_BASE_URL -- refusing to start")
+            return []
+        if primary.rstrip("/") != (os.environ.get("ANTIREFUSAL_UPSTREAM") or "").rstrip("/"):
+            log.warning("single-upstream: ignoring stale ANTIREFUSAL_UPSTREAM=%r, "
+                        "using CUSTOM_BASE_URL=%s", os.environ.get("ANTIREFUSAL_UPSTREAM"), primary)
+        add("env", primary)
+        if len(ups) == 0:
+            log.error("single-upstream %s unusable (self-loop or no key) -- refusing to start",
+                      primary)
+        elif len(ups) > 1:
+            log.error("single-upstream violated: %s -- keeping only the first",
+                      [u["base"] for u in ups])
+            del ups[1:]
+        return ups
 
     env_up = os.environ.get("ANTIREFUSAL_UPSTREAM")
     if env_up:

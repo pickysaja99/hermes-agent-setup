@@ -137,7 +137,15 @@ clone_repo() {
   local url="$REPO_URL"
   local helper_args=()
   if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-    url="$(printf '%s' "$REPO_URL" | sed -E "s#https://#https://x-access-token:${GITHUB_TOKEN}@#")"
+    # x-access-token:<TOKEN>@ built with a real expansion. The old form put
+    # ${GITHUB_TOKEN} inside a single-quoted sed script; it got truncated and left
+    # install.sh unrunnable (unterminated quote + bad substitution).
+    local _tok="${GITHUB_TOKEN}"
+    url="https://x-access-token:${_tok}@${REPO_URL#https://}"
+    # (single-quoted sed script with ${GITHUB_TOKEN} inline) got truncated and
+    # left install.sh unrunnable: unterminated quote + bad substitution.
+    local _tok="${GITHUB_TOKEN}"
+    url="${REPO_URL/https:\/\//https:\/\/x-access-token:${_tok}@}"
   elif command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
     helper_args=(-c credential.helper="!gh auth git-credential")
   fi
@@ -189,13 +197,37 @@ backup_hermes() {
 install_files() {
   local S="$WORKDIR/repo"
   say "installing setup files"
-  run cp "$S/SOUL.md"    "$HERMES_HOME/SOUL.md"
-  run cp "$S/profile.yaml" "$HERMES_HOME/profile.yaml"
-  run cp -r "$S/skills"   "$HERMES_HOME/"
-  run cp -r "$S/memories" "$HERMES_HOME/"
-  run cp -r "$S/plugins"  "$HERMES_HOME/"
-  run cp -r "$S/anti-refusal" "$HERMES_HOME/"
-  run cp "$S/README.md"   "$HERMES_HOME/SETUP-README.md"
+  # MERGE-COPY, never `cp -r src dst/`: re-running the installer used to nest
+  # the tree (HERMES_HOME/skills/skills, plugins/plugins, anti-refusal/anti-
+  # refusal) and, worse, clobber local edits. Contents are merged over the
+  # destination and existing files that differ are backed up first.
+  _merge_copy() {  # src_dir dst_dir
+    local src="$1" dst="$2"
+    [[ -d "$src" ]] || return 0
+    mkdir -p "$dst"
+    if command -v rsync >/dev/null 2>&1; then
+      rsync -a --backup --suffix=".pre-install.$(date +%s)" "$src/" "$dst/" 2>/dev/null \
+        || warn "rsync merge failed for $dst"
+    else
+      ( cd "$src" && find . -type d -print0 | while IFS= read -r -d '' d; do
+          mkdir -p "$dst/$d"
+        done )
+    ( cd "$src" && find . -type f -print0 | while IFS= read -r -d '' f; do
+          if [[ -f "$dst/$f" ]] && ! cmp -s "$f" "$dst/$f"; then
+            cp -a "$dst/$f" "$dst/$f.pre-install" 2>/dev/null || true
+          fi
+          cp -a "$f" "$dst/$f"
+        done )
+    fi
+  }
+
+  run cp -a "$S/SOUL.md"    "$HERMES_HOME/SOUL.md"
+  run cp -a "$S/profile.yaml" "$HERMES_HOME/profile.yaml"
+  for d in skills memories plugins anti-refusal; do
+    [[ -d "$S/$d" ]] && _merge_copy "$S/$d" "$HERMES_HOME/$d"
+    [[ -d "$S/$d/$d" ]] && rm -rf "$S/$d/$d"   # heal a nested copy in the repo
+  done
+  run cp -a "$S/README.md"   "$HERMES_HOME/SETUP-README.md"
 
   # config.yaml: only install the shipped template if the target has NO config
   # yet. If a config exists, keep it (its model/provider/API-key must survive).
@@ -203,7 +235,43 @@ install_files() {
     run cp "$S/config.yaml" "$HERMES_HOME/config.yaml"
     ok "config.yaml installed (none existed)"
   else
-    ok "existing config.yaml preserved (not overwritten)"
+    # An existing config is NEVER replaced. If it predates a section the
+    # template has, APPEND the missing top-level block instead of dropping
+    # the operator's base_url/api_key/model/gateway settings.
+    local PYC; PYC="$(find_python || true)"
+    if [[ -n "$PYC" && $DRY_RUN -eq 0 ]]; then
+      "$PYC" - "$HERMES_HOME/config.yaml" "$S/config.yaml" <<'PYEOF' || warn "config.yaml merge skipped"
+import re, sys
+dst, tpl = sys.argv[1], sys.argv[2]
+have = open(dst, encoding="utf-8").read()
+want = open(tpl, encoding="utf-8").read()
+
+def blocks(text):
+    out, cur, name = {}, [], None
+    for ln in text.splitlines(keepends=True):
+        if ln.strip() and not ln[0].isspace() and not ln.lstrip().startswith("#"):
+            if name:
+                out[name] = "".join(cur)
+            name, cur = ln.split(":", 1)[0].strip(), [ln]
+        elif name:
+            cur.append(ln)
+    if name:
+        out[name] = "".join(cur)
+    return out
+
+hb, wb = blocks(have), blocks(want)
+missing = [k for k in wb if k not in hb]
+if not missing:
+    print("   config.yaml already has every section")
+    sys.exit(0)
+add = "".join(wb[k] for k in missing)
+if not have.endswith("\n"):
+    have += "\n"
+open(dst, "w", encoding="utf-8").write(have + "\n" + add)
+print("   config.yaml: appended missing sections %s (existing values untouched)" % missing)
+PYEOF
+    fi
+    ok "existing config.yaml preserved (merged, not overwritten)"
   fi
   ok "files copied"
 }
@@ -230,18 +298,34 @@ merge_env() {
     [[ -f "$dst" ]] && cp -a "$dst" "$dst.pre-merge.$(date +%Y%m%d-%H%M%S)"
     local tmp; tmp="$(mktemp)"
     cp "$dst" "$tmp"
-    local added=0
+    local added=0 filled=0 skipped=0
     while IFS= read -r line; do
       # only consider real KEY=... assignment lines
       [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || continue
       local key="${line%%=*}"
-      if ! grep -qE "^${key}=" "$tmp"; then
-        printf "%s\n" "$line" >> "$tmp"
-        added=$((added+1))
+      local newval="${line#*=}"
+      if grep -qE "^${key}=" "$tmp"; then
+        # key already present: an empty value in .env stays unless the
+        # template actually carries one -- never blank a live secret, and
+        # never let a template placeholder replace a real value.
+        local oldval; oldval="$(grep -E "^${key}=" "$tmp" | tail -1 | cut -d= -f2- || true)"
+        if [[ -z "$oldval" && -n "$newval" ]]; then
+          awk -v k="$key" -v v="$newval" '{ if (!done && index($0, k "=") == 1) { print k "=" v; done = 1 } else print }' "$tmp" > "$tmp.2" \
+            && mv "$tmp.2" "$tmp"
+          filled=$((filled+1))
+        fi
+        continue
       fi
+      # new key from the template: skip obvious placeholders so an install can
+      # never inject a demo upstream/key into a configured box
+      case "$newval" in
+        ""|"<"*">"*|*"YOUR_"*|*"your_"*|*"changeme"*|*"REPLACE"*|*"xxxx"*) skipped=$((skipped+1)); continue ;;
+      esac
+      printf "%s\n" "$line" >> "$tmp"
+      added=$((added+1))
     done < "$src"
     mv "$tmp" "$dst"
-    ok ".env merged (kept existing values; added $added new keys)"
+    ok ".env merged (kept existing values; added $added new keys, filled $filled empty, skipped $skipped placeholders)"
   fi
   chmod 600 "$dst"
   ok ".env permissions set to 600"
@@ -512,16 +596,16 @@ configure_upstream() {
   # upstream lama (onihub) saat model.base_url sudah pindah ke mahi.
   [[ -n "$key" ]] && _env_set "CUSTOM_BASE_URL" "$base"
   [[ -n "$key" ]] && _env_set "CUSTOM_API_KEY" "$key"
-  _env_set "ANTIREFUSAL_PORT" "$(grep -E '^ANTIREFUSAL_PORT=' "$HERMES_HOME/.env" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+  _env_set "ANTIREFUSAL_SINGLE_UPSTREAM" "1"
   ok ".env: $keyenv + ANTIREFUSAL_UPSTREAM=$base (+CUSTOM_BASE_URL/CUSTOM_API_KEY)"
 
   # .env selalu punya ANTIREFUSAL_PORT (dipakai unit + proxy)
   grep -qE '^ANTIREFUSAL_PORT=' "$HERMES_HOME/.env" || _env_set "ANTIREFUSAL_PORT" "9200"
 
   if [[ -f "$cfg" ]]; then
-    "$PY" - "$cfg" "$base" "$keyenv" "$model" <<'PYEOF' || warn "config.yaml model block tidak ditulis"
+    "$PY" - "$cfg" "$base" "$keyenv" "$model" "$host" <<'PYEOF' || warn "config.yaml model block tidak ditulis"
 import re, sys
-p, base, keyenv, model = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+p, base, keyenv, model, host = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 lines = open(p, encoding="utf-8").read().splitlines(keepends=True)
 mi = next((i for i, l in enumerate(lines) if re.match(r"^model:\s*(#.*)?$", l)), None)
 if mi is None:
@@ -543,6 +627,11 @@ for l in block:
         break
 
 def quote(v):
+    # ${ENV} references must stay UNQUOTED: PyYAML keeps single quotes literal,
+    # so api_key: '${FOO}' sends the literal text as the bearer and every
+    # request 401s. Only plain scalars that YAML cannot misread are bare.
+    if re.fullmatch(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}", v):
+        return v
     return v if re.fullmatch(r"[A-Za-z0-9_./@-]+", v) else "'%s'" % v.replace("'", "''")
 
 def setkv(key, val):
@@ -553,6 +642,85 @@ def setkv(key, val):
             block[j] = "%s%s: %s\n" % (" " * indent, key, val)
             return
     block.insert(0, "%s%s: %s\n" % (" " * indent, key, val))
+
+def toplevel():
+    """(start, end) line span of each top-level block in the document."""
+    spans, i = {}, 0
+    while i < len(lines):
+        l = lines[i]
+        if l.strip() and not l[0].isspace() and not l.lstrip().startswith("#"):
+            key = l.split(":", 1)[0].strip()
+            j = i + 1
+            while j < len(lines):
+                n = lines[j]
+                if n.strip() and not n[0].isspace() and not n.lstrip().startswith("#"):
+                    break
+                j += 1
+            spans[key] = (i, j)
+            i = j
+        else:
+            i += 1
+    return spans
+
+
+spans = toplevel()
+prov = spans.get("providers")
+seed = [
+    "providers:\n",
+    "  custom:\n",
+    "    base_url: %s\n" % quote(base),
+    "    api_key: %s\n" % quote("${%s}" % keyenv),
+    "    api_mode: chat_completions\n",
+    "    model: %s\n" % quote(model),
+]
+if prov:
+    blk = lines[prov[0]:prov[1]]
+    if not any(l.startswith("  custom:") for l in blk):
+        # add the custom provider at the END of the existing block
+        blk = blk[0:1] + blk[1:] + seed[1:]
+        lines[prov[0]:prov[1]] = blk
+    # an existing custom: provider is preserved verbatim -- never overwritten
+elif "model" in spans:
+    k = spans["model"][1]
+    if k and not lines[k - 1].endswith("\n"):
+        lines[k - 1] += "\n"
+    lines[k:k] = seed
+    spans = toplevel()
+
+# custom_providers (the operator's saved router list: name/base_url/key_env/
+# model). A re-run must ADD the current router when it is absent and keep
+# every other entry — wiping this list is the "configurasi gateway/model
+# hilang setelah install" bug.
+cp = spans.get("custom_providers")
+ENTRY = ["  - name: %s\n" % quote(host or base),
+         "    base_url: %s\n" % quote(base),
+         "    key_env: %s\n" % keyenv,
+         "    model: %s\n" % quote(model)]
+
+
+def cp_has(blk):
+    """True when the router is already listed — indentation/quote-insensitive
+    (a `"    base_url: x"` vs `base_url: 'x'` mismatch duplicated the entry
+    on every re-run)."""
+    for l in blk:
+        if l.strip().startswith("- name:"):
+            if l.split("name:", 1)[1].strip().strip("'\"") == (host or base):
+                return True
+        if "base_url:" in l and l.split("base_url:", 1)[1].strip().strip("'\"").rstrip("/") == base.rstrip("/"):
+            return True
+    return False
+
+
+if cp:
+    blk = lines[cp[0]:cp[1]]
+    if not cp_has(blk):
+        if not blk[-1].endswith("\n"):
+            blk[-1] += "\n"
+        blk = blk + ENTRY
+        lines[cp[0]:cp[1]] = blk
+else:
+    k = spans["model"][1] if "model" in spans else len(lines)
+    lines[k:k] = ["custom_providers:\n"] + ENTRY
 
 setkv("base_url", quote(base))
 setkv("api_key", quote("${%s}" % keyenv))
@@ -589,19 +757,24 @@ def hostof(b):
 
 want = host.lower()
 ups = [u for u in (cfg.get("upstreams") or []) if isinstance(u, dict)]
-kept = [u for u in ups if u.get("base", "").rstrip("/") != base.rstrip("/")
-        and hostof(u.get("base", "")) == want]
-dropped = [u.get("base") for u in ups if hostof(u.get("base", "")) != want and u.get("base", "").rstrip("/") != base.rstrip("/")]
-cfg["upstreams"] = [{"name": host, "base": base, "key_env": keyenv}] + kept
+kept = []  # single-upstream contract: no siblings kept
+dropped = [u.get("base") for u in ups if u.get("base", "").rstrip("/") != base.rstrip("/")]
+cfg["upstreams"] = [{"name": host, "base": base, "key_env": keyenv}]
+cfg["single_upstream"] = True
+cfg["extra_upstreams"] = []
 cfg["upstream_base_url"] = base
 cfg["upstream_key_env"] = keyenv
 cfg["default_model"] = model
-if models:
-    seen, out = set(), []
-    for m in [model] + models:
-        if m not in seen:
-            seen.add(m); out.append(m)
-    cfg["models"] = out[:64]
+# models: ALWAYS keep the chosen model first. The old guard only wrote the
+# list when /models answered, leaving a stale default_model's model list
+# (e.g. ...-flash when default is ...-flash-1017) -- the proxy's ladder then
+# climbed to a model the operator never picked.
+seen, out = set(), []
+for m in [model] + models:
+    if m and m not in seen:
+        seen.add(m)
+        out.append(m)
+cfg["models"] = out[:64]
 json.dump(cfg, open(p, "w"), indent=2)
 print("   anti-refusal config -> upstream=%s default=%s models=%d kept=%d dropped=%s"
       % (base, model, len(cfg.get("models") or []), len(kept), dropped or "none"))
@@ -780,7 +953,15 @@ activate_antirefusal() {
     upstream="$(grep -E '^ANTIREFUSAL_UPSTREAM=' "$HERMES_HOME/.env" | tail -1 | cut -d= -f2- || true)"
     [[ -z "$upstream" ]] && upstream="$(grep -E '^CUSTOM_BASE_URL=' "$HERMES_HOME/.env" | tail -1 | cut -d= -f2- || true)"
   fi
-  [[ -z "$upstream" ]] && upstream="https://token.lightvela.ai/v1"
+  # OPERATOR CONTRACT: one upstream, taken from .env only. A missing value is
+  # an ERROR the operator must fix — never substitute another router.
+  if [[ -z "$upstream" ]]; then
+    warn "ANTIREFUSAL_UPSTREAM/CUSTOM_BASE_URL kosong di .env — proxy tidak diarahkan ke host lain"
+    ANTIREFUSAL_STATUS="no-upstream"
+    return 0
+  fi
+  # mirror it back so .env stays the single source of truth
+  _env_set "ANTIREFUSAL_UPSTREAM" "$upstream"
 
   # listen port: allow override from .env (default 9200)
   local ar_port="9200"
@@ -825,6 +1006,7 @@ RestartSec=3
 EnvironmentFile=-$HERMES_HOME/.env
 Environment=PYTHONUNBUFFERED=1
 Environment=ANTIREFUSAL_UPSTREAM=$upstream
+Environment=ANTIREFUSAL_SINGLE_UPSTREAM=1
 Environment=ANTIREFUSAL_PORT=$ar_port
 
 [Install]
@@ -878,6 +1060,7 @@ UNIT
     pkill -f "$AR/proxy.py" 2>/dev/null || true
     sleep 1
     ANTIREFUSAL_UPSTREAM="$upstream" ANTIREFUSAL_PORT="$ar_port" \
+      ANTIREFUSAL_SINGLE_UPSTREAM=1 \
       nohup "$PY" "$AR/proxy.py" >"$AR/proxy.out" 2>&1 &
     echo $! > "$AR/proxy.pid"
     ok "started background proxy (pid $(cat "$AR/proxy.pid"))"

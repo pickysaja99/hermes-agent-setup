@@ -47,9 +47,10 @@ SWITCH_COOLDOWN_S = 300
 GATEWAY_UNIT = "hermes-gateway.service"
 
 PROXY_BASE = "http://127.0.0.1:9200/v1"
-DIRECT_BASE = "https://onihub.tech/v1"
-FALLBACK_KEY_ENV = "HERMES_CUSTOM_ONIHUB_TECH_API_KEY"
-DEFAULT_MODEL = "step-5-preview-UNCENSORED"
+# OPERATOR CONTRACT: ONE upstream only — the primary router in .env. No
+# hard-coded host here (that is how a dead onihub kept being reintroduced
+# after model.base_url had already moved to the live router).
+DEFAULT_MODEL = ""  # resolved from config.yaml model.default / config.json
 CANARY_PROMPT = "ping"
 AR_CFG = HERMES_HOME / "anti-refusal" / "config.json"
 
@@ -86,6 +87,8 @@ def read_canary_model() -> str:
         for m in models:
             if m and m != default:
                 return m
+    # single-upstream boxes usually have exactly one model in the list ==
+    # model.default; canary with it rather than skipping the canary.
     return default
 
 
@@ -116,11 +119,86 @@ def read_ar_cfg() -> dict:
         return {}
 
 
+def read_env() -> dict:
+    """Parse ~/.hermes/.env (KEY=VALUE, no shell expansion needed)."""
+    out = {}
+    try:
+        for line in ENV.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip().strip("'\"")
+    except OSError:
+        pass
+    return out
+
+
+def primary_upstream() -> tuple:
+    """(base, key_env) of the ONE primary router, from .env -> config.json.
+
+    `.env` is the single source of truth (ANTIREFUSAL_UPSTREAM /
+    CUSTOM_BASE_URL). config.json is only a derived mirror, used when .env
+    is silent. NEVER falls back to a hard-coded host: a missing primary
+    means there is nothing to fail over to, and the watchdog says so
+    instead of dragging a dead host back in.
+    """
+    env = read_env()
+    base = (env.get("ANTIREFUSAL_UPSTREAM") or env.get("CUSTOM_BASE_URL") or "").strip()
+    ar = read_ar_cfg()
+    if not base:
+        base = str(ar.get("upstream_base_url") or "").strip()
+    if not base:
+        ups = [u for u in (ar.get("upstreams") or []) if isinstance(u, dict)]
+        if ups:
+            base = str(ups[0].get("base") or "").strip()
+    key_env = str(ar.get("upstream_key_env") or "").strip()
+    if base:
+        norm = lambda b: _norm_url(b)
+        for item in ar.get("upstreams") or []:
+            if isinstance(item, dict) and norm(item.get("base", "")) == norm(base):
+                key_env = item.get("key_env") or key_env
+                break
+        if not key_env:
+            host = _host_port(base)[0]
+            key_env = "HERMES_CUSTOM_%s_API_KEY" % re.sub(r"[^A-Za-z0-9]+", "_", host).upper()
+        if base.rstrip("/") == str(ar.get("upstream_base_url") or "").rstrip("/"):
+            key_env = str(ar.get("upstream_key_env") or key_env)
+    return base.rstrip("/"), key_env
+
+
+def _norm_url(b: str) -> str:
+    return (b or "").rstrip("/").lower()
+
+
 def log(msg: str) -> None:
     line = "%s %s\n" % (time.strftime("%m-%d %H:%M:%S"), msg)
     with open(LOG, "a") as f:
         f.write(line)
     print(line, end="")
+
+
+def key_for_host(base: str) -> str:
+    """Bearer for `base`, matched by host from .env (HERMES_CUSTOM_<HOST>_API_KEY).
+
+    Falls back to the single upstream key when only one key exists, so a
+    renamed env var cannot leave the canary/ failover with an empty bearer.
+    """
+    env = read_env()
+    host = _host_port(base)[0] if base else ""
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", host).upper()
+    cands = ["HERMES_CUSTOM_%s_API_KEY" % slug, "CUSTOM_API_KEY"]
+    for c in cands:
+        if env.get(c):
+            return env[c]
+    for k, v in env.items():
+        if v and len(v) >= 8 and ("_API_KEY" in k or k.endswith("_KEY")):
+            if slug and slug.split("_")[0] and slug.split("_")[0] in k:
+                return v
+    _b, key_env = primary_upstream()
+    if key_env and env.get(key_env):
+        return env[key_env]
+    return ""
 
 
 def load_env_key(name: str) -> str:
@@ -311,13 +389,16 @@ def save_state(st: dict) -> None:
 
 
 def candidates() -> list:
-    """Ordered failover targets: (label, base_url, key_env, timeout_s).
+    """Failover targets: (label, base_url, key_env, timeout_s).
 
-    Direct upstreams come from anti-refusal/config.json (so a failover after
-    install follows the operator's chosen router, not a hard-coded one),
-    then the proxy last. The proxy is EXCLUDED when its own config points
-    at itself (127.0.0.1:9200) — that self-loop answers 200-empty and would
-    "rescue" the config onto a dead endpoint.
+    OPERATOR CONTRACT (one upstream): the ONLY direct candidate is the
+    primary router from `.env` (see primary_upstream()). The residual list in
+    anti-refusal/config.json is deliberately NOT walked — that ladder is how
+    a dead host (onihub/old router) kept getting promoted back into
+    model.base_url after the operator had already chosen a new one.
+
+    The local proxy is offered as the LAST candidate only, and only when its
+    upstream is not itself (self-loop) and it is not the active base.
     """
     out, seen = [], set()
 
@@ -328,21 +409,14 @@ def candidates() -> list:
         seen.add(base)
         out.append((label, base, key_env, timeout))
 
-    ar = read_ar_cfg()
-    for item in ar.get("upstreams") or []:
-        if isinstance(item, dict) and item.get("base"):
-            add(item.get("name") or "direct", item["base"],
-                item.get("key_env") or "", 60.0)
-    legacy = ar.get("upstream_base_url")
-    if legacy:
-        add("direct", legacy, ar.get("upstream_key_env") or "", 60.0)
-    if not out:
-        add("direct", DIRECT_BASE, FALLBACK_KEY_ENV, 60.0)
+    base, key_env = primary_upstream()
+    if base:
+        add("primary", base, key_env, 60.0)
 
     # proxy candidate — skip when it would loop to itself
     proxy_self = False
-    env_up = os.environ.get("ANTIREFUSAL_UPSTREAM", "")
-    for b in [env_up] + [u[1] for u in out]:
+    env = read_env()
+    for b in [env.get("ANTIREFUSAL_UPSTREAM", ""), base]:
         if b:
             h, prt = _host_port(b)
             if h in ("127.0.0.1", "localhost", "::1") and prt == 9200:
@@ -356,7 +430,12 @@ def check_once(dry_run: bool = False) -> str:
     active = read_base_url()
     if not active:
         return "no-base_url (skip)"
-    key = load_env_key(FALLBACK_KEY_ENV)
+    # key for the ACTIVE base: host-matched from .env via the primary router
+    # record; never borrow a hard-coded host's token.
+    key = key_for_host(active)
+    if not key:
+        _pb, _pke = primary_upstream()
+        key = load_env_key(_pke) if _pke else ""
     model = read_canary_model()
     alive, detail = canary(active, key, model)
     st = load_state()
