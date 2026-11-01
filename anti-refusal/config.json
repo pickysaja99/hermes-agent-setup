@@ -1,36 +1,17 @@
 {
   "port": 9200,
   "max_attempts": 8,
-  "request_budget_s": 540,
-  "upstream_timeout": 180,
+  "request_budget_s": 600,
+  "upstream_timeout": 75,
   "upstream_connect_timeout": 30,
-  "inject_light": false,
-  "force_prefill": false,
+  "inject_light": true,
+  "force_prefill": true,
   "host_aware_keys": true,
-  "default_model": "step-5-preview-UNCENSORED",
-  "models": [
-    "step-5-preview-UNCENSORED",
-    "glm-5.3-flash",
-    "glm-5-3-flash-UNCENSORED",
-    "deepseek-v4.1-flash",
-    "deepseek-v4-1-flash-UNRESTRICTED",
-    "deepseek-v4-flash",
-    "deepseek-v4-flash-0731",
-    "mercury-3",
-    "minimax-m2.7"
-  ],
-  "upstreams": [
-    {
-      "name": "onihub",
-      "base": "https://onihub.tech/v1",
-      "key_env": "HERMES_CUSTOM_ONIHUB_TECH_API_KEY"
-    },
-    {
-      "name": "morku",
-      "base": "https://api.morku.my.id/v1",
-      "key_env": "HERMES_CUSTOM_API_MORKU_MY_ID_API_KEY"
-    }
-  ],
-  "upstream_base_url": "https://onihub.tech/v1",
-  "upstream_key_env": "HERMES_CUSTOM_ONIHUB_TECH_API_KEY"
+  "default_model": "",
+  "models": [],
+  "upstreams": [],
+  "upstream_base_url": "",
+  "upstream_key_env": "",
+  "single_upstream": true,
+  "extra_upstreams": []
 }

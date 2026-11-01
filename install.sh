@@ -221,32 +221,76 @@ install_files() {
     fi
   }
 
-  run cp -a "$S/SOUL.md"    "$HERMES_HOME/SOUL.md"
-  run cp -a "$S/profile.yaml" "$HERMES_HOME/profile.yaml"
-  for d in skills memories plugins anti-refusal; do
-    [[ -d "$S/$d" ]] && _merge_copy "$S/$d" "$HERMES_HOME/$d"
-    [[ -d "$S/$d/$d" ]] && rm -rf "$S/$d/$d"   # heal a nested copy in the repo
+  # SOUL.md / profile.yaml: back up and only replace when the repo copy is
+  # NEWER or missing on the target. A blind cp-a used to overwrite an
+  # operator's local SOUL edits on every re-install.
+  # SOUL.md is the identity/consciousness file: the repo copy is
+  # AUTHORITATIVE and always wins (operator decision — an out-of-date local
+  # SOUL is worse than a clobbered one). Back it up, then overwrite.
+  if [[ -f "$S/SOUL.md" ]]; then
+    if [[ -f "$HERMES_HOME/SOUL.md" ]] && ! cmp -s "$S/SOUL.md" "$HERMES_HOME/SOUL.md"; then
+      run cp -a "$HERMES_HOME/SOUL.md" "$HERMES_HOME/SOUL.md.pre-install.$(date +%s)"
+    fi
+    run cp -a "$S/SOUL.md" "$HERMES_HOME/SOUL.md"
+    ok "SOUL.md deployed (repo copy is authoritative; previous saved as .pre-install)"
+  fi
+  # profile.yaml carries local runtime settings (active profile etc.) and must
+  # NOT be silently reverted — it is installed ONCE, only when absent. A
+  # newer-mtime rule is wrong here: the cloned repo is always newer than a
+  # file the operator has been using, so that rule reverted it every run.
+  if [[ -f "$S/profile.yaml" && ! -f "$HERMES_HOME/profile.yaml" ]]; then
+    run cp -a "$S/profile.yaml" "$HERMES_HOME/profile.yaml"
+    ok "profile.yaml installed (none existed)"
+  elif [[ -f "$HERMES_HOME/profile.yaml" ]]; then
+    printf '  [keep] profile.yaml (existing local settings preserved)\n'
+  fi
+  local _sd
+  for _sd in skills memories plugins; do
+    [[ -d "$S/$_sd" ]] && _merge_copy "$S/$_sd" "$HERMES_HOME/$_sd"
+    [[ -d "$S/$_sd/$_sd" ]] && rm -rf "$S/$_sd/$_sd"   # heal a nested copy in the repo
   done
+  # anti-refusal: copy the CODE, never the derived config.json. Clobbering it
+  # with the template silently disarmed the refusal ladder (inject_light /
+  # force_prefill false, max_attempts 1) on every re-install. configure_upstream
+  # / activate_antirefusal own that file, and arm_proxy re-arms it.
+  if [[ -d "$S/anti-refusal" ]]; then
+    mkdir -p "$HERMES_HOME/anti-refusal"
+    local arf
+    for arf in "$S"/anti-refusal/*; do
+      [[ -f "$arf" ]] || continue
+      [[ "$(basename "$arf")" == "config.json" ]] && continue
+      if [[ -f "$HERMES_HOME/anti-refusal/$(basename "$arf")" ]] \
+         && ! cmp -s "$arf" "$HERMES_HOME/anti-refusal/$(basename "$arf")"; then
+        cp -a "$HERMES_HOME/anti-refusal/$(basename "$arf")" \
+              "$HERMES_HOME/anti-refusal/$(basename "$arf").pre-install.$(date +%s)" 2>/dev/null || true
+      fi
+      run cp -a "$arf" "$HERMES_HOME/anti-refusal/$(basename "$arf")"
+    done
+  fi
   run cp -a "$S/README.md"   "$HERMES_HOME/SETUP-README.md"
 
-  # config.yaml: only install the shipped template if the target has NO config
-  # yet. If a config exists, keep it (its model/provider/API-key must survive).
+  # config.yaml policy (operator rule): the REPO TEMPLATE WINS for everything
+  # EXCEPT four things that belong to the operator and must never be lost:
+  #   1. model.base_url   2. model.api_key   3. model.default (model id)
+  #   4. the whole `gateway:` block
+  # Everything else (agent:, tools:, platforms:, approvals:, ...) is taken from
+  # the template so a re-install always converges to the shipped defaults.
   if [[ ! -f "$HERMES_HOME/config.yaml" ]]; then
     run cp "$S/config.yaml" "$HERMES_HOME/config.yaml"
     ok "config.yaml installed (none existed)"
   else
-    # An existing config is NEVER replaced. If it predates a section the
-    # template has, APPEND the missing top-level block instead of dropping
-    # the operator's base_url/api_key/model/gateway settings.
     local PYC; PYC="$(find_python || true)"
     if [[ -n "$PYC" && $DRY_RUN -eq 0 ]]; then
+      run cp -a "$HERMES_HOME/config.yaml" "$HERMES_HOME/config.yaml.pre-install.$(date +%s)"
       "$PYC" - "$HERMES_HOME/config.yaml" "$S/config.yaml" <<'PYEOF' || warn "config.yaml merge skipped"
 import re, sys
+
 dst, tpl = sys.argv[1], sys.argv[2]
 have = open(dst, encoding="utf-8").read()
 want = open(tpl, encoding="utf-8").read()
 
 def blocks(text):
+    """top-level key -> its full text block (comments above it excluded)."""
     out, cur, name = {}, [], None
     for ln in text.splitlines(keepends=True):
         if ln.strip() and not ln[0].isspace() and not ln.lstrip().startswith("#"):
@@ -260,19 +304,60 @@ def blocks(text):
     return out
 
 hb, wb = blocks(have), blocks(want)
-missing = [k for k in wb if k not in hb]
-if not missing:
-    print("   config.yaml already has every section")
-    sys.exit(0)
-add = "".join(wb[k] for k in missing)
-if not have.endswith("\n"):
-    have += "\n"
-open(dst, "w", encoding="utf-8").write(have + "\n" + add)
-print("   config.yaml: appended missing sections %s (existing values untouched)" % missing)
+
+# --- the four protected values, lifted out of the operator's current file ---
+def model_val(key, text):
+    """value of a key on the model: block at exactly 2-space indent."""
+    m = re.search(r"(?m)^model:\s*$", text)
+    if not m:
+        return None
+    m2 = re.search(r"(?m)^  " + key + r":\s*(.*)$", text[m.end():])
+    if not m2:
+        return None
+    v = m2.group(1).strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        v = v[1:-1]
+    return v
+
+protected = {k: model_val(k, have) for k in ("base_url", "api_key", "default")}
+gateway_block = hb.get("gateway")
+
+# --- build the new file: template blocks, protected values re-applied ---
+merged = dict(wb)
+mblk = wb.get("model")
+if mblk:
+    for key, val in protected.items():
+        if val is None:
+            continue
+        if re.search(r"(?m)^  " + key + r":", mblk):
+            mblk = re.sub(r"(?m)^  " + key + r":.*$",
+                          lambda _m, k=key, v=val: "  %s: %s" % (k, v), mblk, count=1)
+        else:
+            mblk = mblk.rstrip("\n") + "\n  %s: %s\n" % (key, val)
+    merged["model"] = mblk
+if gateway_block:
+    merged["gateway"] = gateway_block
+elif "gateway" in wb:
+    pass  # template gateway stands when the operator had none
+
+# blocks the operator has that the template does not: keep them (unknown sections
+# like `aliases:` are not ours to delete).
+for k, v in hb.items():
+    if k not in merged:
+        merged[k] = v
+
+order = list(wb.keys()) + [k for k in hb.keys() if k not in wb]
+out = "".join(merged[k] for k in order if k in merged)
+open(dst, "w", encoding="utf-8").write(out)
+kept = [k for k, v in protected.items() if v]
+print("   config.yaml: template applied; preserved %s%s" % (
+    ", ".join("model." + k for k in kept),
+    " + gateway:" if gateway_block else ""))
 PYEOF
     fi
-    ok "existing config.yaml preserved (merged, not overwritten)"
+    ok "config.yaml converged (template wins; base_url/api_key/model/gateway preserved)"
   fi
+
   ok "files copied"
 }
 
@@ -494,7 +579,9 @@ configure_upstream() {
   def_base="$(_san_base "$cur_base")"
   [[ -z "$def_base" ]] && def_base="$(_san_base "$(_env_get ANTIREFUSAL_UPSTREAM)")"
   [[ -z "$def_base" ]] && def_base="$(_san_base "$(_env_get CUSTOM_BASE_URL)")"
-  [[ -z "$def_base" ]] && def_base="https://onihub.tech/v1"
+  # No hardcoded default router. A stale house host used to be offered as the
+  # default Base URL, so a branch-new install could point at a router the
+  # operator never chose (and had no key for). Empty = ask the operator.
 
   local base="${SETUP_BASE_URL:-}" key="${SETUP_API_KEY:-}" model="${SETUP_MODEL:-}" models=""
 

@@ -228,3 +228,45 @@ systemctl --user status antirefusal   # if installed as a unit
 | `unrestricted.sh` | Guard-disable patcher (`--check` / `--revert`) |
 | `README-INSTALLER.md` | This document |
 | `LICENSE` | License |
+
+---
+
+## Kebijakan konfigurasi saat install / update / reinstall
+
+`install.sh` bersifat idempoten dan **tidak menghapus** konfigurasi router.
+Saat `config.yaml` sudah ada, file itu **tidak diganti utuh** — hanya empat hal
+berikut yang dipertahankan dari file operator, sisanya diambil dari template repo:
+
+| Dipertahankan selamanya | Diambil dari template repo |
+|---|---|
+| `model.base_url` | `_config_version`, `context_file_max_chars` |
+| `model.api_key` | `agent:`, `display:`, `compression:`, `toolsets:` |
+| `model.default` (model id) | `platforms:`, `approvals:`, `memory:` |
+| seluruh blok `gateway:` | semua section lain |
+
+Section milik operator yang tidak ada di template (mis. `aliases:`,
+`custom_providers:` tambahan) **tidak dihapus**.
+
+**SOUL.md** dideploy ulang dari repo setiap kali (repo adalah sumber otoritatif);
+versi lama disimpan sebagai `SOUL.md.pre-install.<timestamp>`.
+**profile.yaml** hanya dipasang bila belum ada — setting lokal tidak direset.
+
+### Proxy anti-refusal: satu upstream saja
+
+`anti-refusal/config.json` **tidak pernah ditimpa** oleh `install_files`.
+Upstream tunggalnya diturunkan dari `.env`:
+
+```
+ANTIREFUSAL_UPSTREAM   # Base URL router (fallback: CUSTOM_BASE_URL)
+ANTIREFUSAL_SINGLE_UPSTREAM=1
+```
+
+`arm_proxy()` di `unrestricted.sh` memaksa `single_upstream: true`,
+mengosongkan `extra_upstreams`, dan memangkas `upstreams[]` jadi satu entri —
+ladder retry hanya memutar **model** di router itu, tidak pernah failover ke
+host lain.
+
+### Idempotensi
+
+Jalankan `bash install.sh` berkali-kali: `model.base_url`, `model.api_key`,
+`model.default`, `gateway:`, dan seluruh `.env` tetap byte-identik.

@@ -32,7 +32,7 @@ curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
 # (or: pip install hermes-agent)
 
 # 2. Clone this repo and overlay it onto your .hermes dir
-git clone https://github.com/br111e/hermes-agent-setup hermes-agent-setup
+git clone https://github.com/pickysaja99/hermes-agent-setup hermes-agent-setup
 cp hermes-agent-setup/SOUL.md ~/.hermes/SOUL.md
 cp hermes-agent-setup/config.yaml ~/.hermes/config.yaml
 cp hermes-agent-setup/profile.yaml ~/.hermes/profile.yaml
