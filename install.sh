@@ -1474,32 +1474,43 @@ activate_unrestricted() {
   fi
   say "applying unrestricted patch (disabling internal guards)"
 
-  # locate the Hermes agent source (where the guards live)
-  local agent_dir="${HERMES_AGENT_DIR:-$HERMES_HOME/hermes-agent}"
-  if [[ ! -d "$agent_dir" ]]; then
-    warn "hermes-agent source not found at $agent_dir — skipping guard patch"
-    warn "  (set HERMES_AGENT_DIR if your checkout lives elsewhere)"
-    UNRESTRICTED_STATUS="no-source"
-    return 0
-  fi
-
-  # 1. force HERMES_UNRESTRICTED=1 in .env so every Hermes process honors it
+  # 1. force HERMES_UNRESTRICTED=1 in .env so every Hermes process honors it.
+  #    This MUST happen before any early return below: it only needs .env, not
+  #    the agent source. Previously a missing hermes-agent checkout returned
+  #    early and left the flag unset, so a fresh box reported "installed"
+  #    while every guard stayed ON.
   local envf="$HERMES_HOME/.env"
   if [[ $DRY_RUN -eq 0 && -f "$envf" ]]; then
     if grep -qE '^HERMES_UNRESTRICTED=' "$envf"; then
-      # normalize to 1 (never leave a stale 0)
-      "$PY_BIN" - "$envf" <<'PYEOF' 2>/dev/null || \
-        sed -i 's/^HERMES_UNRESTRICTED=.*/HERMES_UNRESTRICTED=1/' "$envf"
+      # normalize to 1 (never leave a stale 0). PY_BIN may be empty when no
+      # yaml-capable python exists: guard it instead of running "" and relying
+      # on the || fallback.
+      if [[ -n "${PY_BIN:-}" ]]; then
+        "$PY_BIN" - "$envf" <<'PYEOF' 2>/dev/null || \
+          sed -i 's/^HERMES_UNRESTRICTED=.*/HERMES_UNRESTRICTED=1/' "$envf"
 import io, sys, re
 p = sys.argv[1]
 s = io.open(p, encoding="utf-8").read()
 s = re.sub(r'(?m)^HERMES_UNRESTRICTED=.*$', 'HERMES_UNRESTRICTED=1', s)
 io.open(p, "w", encoding="utf-8").write(s)
 PYEOF
+      else
+        sed -i 's/^HERMES_UNRESTRICTED=.*/HERMES_UNRESTRICTED=1/' "$envf"
+      fi
     else
       printf '\n# Unrestricted build — disables internal guards (SOUL/MEMORY honored verbatim)\nHERMES_UNRESTRICTED=1\n' >> "$envf"
     fi
     ok "HERMES_UNRESTRICTED=1 set in $envf"
+  fi
+
+  # locate the Hermes agent source (where the guards live)
+  local agent_dir="${HERMES_AGENT_DIR:-$HERMES_HOME/hermes-agent}"
+  if [[ ! -d "$agent_dir" ]]; then
+    warn "hermes-agent source not found at $agent_dir — skipping guard patch"
+    warn "  (set HERMES_AGENT_DIR if your checkout lives elsewhere)"
+    warn "  HERMES_UNRESTRICTED=1 tetap ditulis; patch source belum diterapkan"
+    UNRESTRICTED_STATUS="no-source"
+    return 0
   fi
 
   # 2. run the patch script against the agent source
