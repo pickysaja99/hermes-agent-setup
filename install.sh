@@ -402,6 +402,23 @@ for k, v in have.items():
 
 # custom_providers: UNION, keyed by name (then base_url) so a re-install never
 # drops the operator's own routers. The template's entry wins on conflict.
+#
+# BY DESIGN -- DO NOT CONSOLIDATE WITH ``providers:`` BELOW.
+# A custom endpoint legitimately appears in BOTH sections and that is not
+# duplication to be pruned:
+#   * ``custom_providers`` is the endpoint REGISTRY. Credential resolution for
+#     a bare ``custom`` route goes through
+#     runtime_provider_custom.custom_provider_config_path_for_url(), which
+#     scans ONLY get_compatible_custom_providers() (i.e. this list) and takes
+#     the FIRST base_url match to find the owning key_env. Remove the entry
+#     here and the route loses its key owner -> 401 invalid_api_key.
+#     This is the bug fixed in b863cf2 (key_env was not kept in sync).
+#   * ``providers.<name>`` is the per-name ROUTE definition, read by
+#     model_catalog / runtime provider selection (cfg["providers"][name]).
+# Neither section is a fallback for the other; both writes are REQUIRED.
+# Real duplicates would be two entries with the SAME base_url *inside one*
+# section -- verify_custom_provider_consistency() below reports that; a
+# cross-section pair is expected and must be left alone.
 def key_of(entry):
     if isinstance(entry, dict):
         return entry.get("name") or entry.get("base_url") or str(entry)[:80]
@@ -858,6 +875,9 @@ if not isinstance(prov, dict):
 custom = prov.get("custom")
 if not isinstance(custom, dict):
     custom = {}
+# Snapshot the PRE-WRITE state: custom.update() below repairs key_env, so a
+# check that ran afterwards could never see the drift it is meant to report.
+_prev_custom = dict(custom)
 custom.update({
     "base_url": base,
     "api_key": "${%s}" % keyenv,
@@ -884,6 +904,79 @@ if not any(matches(e) for e in cps):
     cps.append({"name": host or base, "base_url": base,
                 "key_env": keyenv, "model": model})
 doc["custom_providers"] = cps
+
+# --- CONSISTENCY CHECK (read-only): custom_providers <-> providers.<name> --
+# A custom endpoint is expected in BOTH sections (see the BY DESIGN note above);
+# this verifies they agree instead of "fixing" them. Reports, never blocks and
+# never rewrites: a drift here is a diagnosis for the operator, not a reason to
+# drop a valid config on the floor.
+def _norm(u):
+    return str(u or "").strip().rstrip("/")
+
+def _check():
+    prov2 = doc.get("providers")
+    prov2 = prov2 if isinstance(prov2, dict) else {}
+    by_url = {}
+    for name, pc in prov2.items():
+        if isinstance(pc, dict) and _norm(pc.get("base_url")):
+            by_url.setdefault(_norm(pc.get("base_url")), []).append((name, pc))
+    problems = []
+
+    # 1) duplicates INSIDE custom_providers == the only real duplicate defect
+    seen_url, dup_url = {}, []
+    for e in cps:
+        u = _norm(e.get("base_url"))
+        if not u:
+            continue
+        if u in seen_url:
+            dup_url.append(u)
+        seen_url[u] = True
+    for u in sorted(set(dup_url)):
+        problems.append("duplicate base_url inside custom_providers: %s" % u)
+
+    # 2) every registry entry must have an owning key_env and a route peer
+    for e in cps:
+        u = _norm(e.get("base_url"))
+        nm = e.get("name")
+        if not u:
+            continue
+        if not str(e.get("key_env") or "").strip():
+            problems.append("custom_providers[%s] has no key_env (key cannot resolve)" % nm)
+        peers = by_url.get(u) or []
+        if not peers:
+            problems.append("custom_providers[%s] (%s) has no providers.* peer "
+                            "-- route definition missing" % (nm, u))
+            continue
+        # 3) base_url peers must agree on key_env, else the route reads another
+        #    endpoint's key. THIS is the 401 class fixed in b863cf2.
+        want_key = str(e.get("key_env") or "").strip()
+        for pname, pc in peers:
+            have_key = str(pc.get("key_env") or "").strip()
+            if want_key and have_key and have_key != want_key:
+                problems.append("key_env mismatch for %s: custom_providers[%s]=%s "
+                                "but providers.%s=%s" % (u, nm, want_key, pname, have_key))
+
+    # 4) the live route's key_env must match what was just written. Compare
+    #    against the PRE-WRITE snapshot (_prev_custom): the update above always
+    #    sets key_env correctly, so reading the live value here would always
+    #    look clean and hide the 401 class entirely.
+    if str(_prev_custom.get("key_env") or "").strip():
+        if _norm(_prev_custom.get("base_url")) == _norm(base) and \
+           str(_prev_custom.get("key_env")).strip() != keyenv:
+            problems.append("STALE providers.custom.key_env=%s was replaced by %s "
+                            "for %s (401 invalid_api_key class, now fixed)"
+                            % (_prev_custom.get("key_env"), keyenv, base))
+    live = prov2.get("custom")
+    if isinstance(live, dict) and str(live.get("key_env") or "").strip():
+        if _norm(live.get("base_url")) == _norm(base) and str(live.get("key_env")).strip() != keyenv:
+            problems.append("providers.custom.key_env=%s != router key_env=%s "
+                            "(401 invalid_api_key class)" % (live.get("key_env"), keyenv))
+    return problems
+
+for _p in _check():
+    print("   WARN config drift: %s" % _p)
+print("   custom_providers: %d entry, %d in providers: (cross-section pairs are BY DESIGN)"
+      % (len(cps), len(doc.get("providers") or {})))
 
 # --- serialise, then PROVE the result round-trips and keeps ${ENV} bare ----
 out = dump_cfg(doc)
