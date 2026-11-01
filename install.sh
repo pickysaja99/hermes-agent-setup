@@ -82,10 +82,19 @@ rollback() {
   # restore backup if we have one
   if [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR/hermes" ]]; then
     warn "restoring ~/.hermes from $BACKUP_DIR/hermes"
-    rm -rf "${HERMES_HOME}.failed" 2>/dev/null || true
-    mv "$HERMES_HOME" "${HERMES_HOME}.failed" 2>/dev/null || true
-    cp -a "$BACKUP_DIR/hermes" "$HERMES_HOME"
-    ok "rolled back. previous dir parked at ${HERMES_HOME}.failed"
+    local parked="${HERMES_HOME}.failed"
+    rm -rf "$parked" 2>/dev/null || true
+    # move the broken tree aside (this carries the nested backups/ dir with it)
+    mv "$HERMES_HOME" "$parked" 2>/dev/null || true
+    # the backup now lives inside the parked dir — restore from there
+    local restore_src="$BACKUP_DIR/hermes"
+    [[ -d "$restore_src" ]] || restore_src="$parked/backups/$(basename "$BACKUP_DIR")/hermes"
+    if [[ -d "$restore_src" ]]; then
+      cp -a "$restore_src" "$HERMES_HOME"
+      ok "rolled back. previous (broken) dir parked at $parked"
+    else
+      warn "could not locate backup at $restore_src — manual recovery: $parked"
+    fi
   fi
   [[ -n "$WORKDIR" && -d "$WORKDIR" ]] && rm -rf "$WORKDIR" 2>/dev/null || true
   exit "$code"
