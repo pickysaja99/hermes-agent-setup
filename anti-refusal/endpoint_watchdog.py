@@ -56,7 +56,7 @@ AR_CFG = HERMES_HOME / "anti-refusal" / "config.json"
 
 
 def _host_port(base: str) -> tuple[str, int]:
-    """('onihub.tech', 443) from 'https://onihub.tech/v1'."""
+    """('router.host', 443) from 'https://router.host/v1'."""
     b = base.split("://", 1)[-1]
     host, _, port = b.partition("/")[0].partition(":")
     try:
