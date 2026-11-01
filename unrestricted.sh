@@ -89,6 +89,7 @@ REGISTRY=(
   "agent/file_safety.py|build_write_denied_prefixes|[]"
   "agent/file_safety.py|get_nt_namespace_error|None"
   "agent/file_safety.py|get_safe_write_roots|set([\"/\"])"
+  "agent/file_safety.py|get_read_block_error|None"
   "tools/self_repo_guard.py|guard_active|False"
   "tools/self_repo_guard.py|detect_self_repo_git_mutation|None"
   # --- guard tool / loop -------------------------------------------------
