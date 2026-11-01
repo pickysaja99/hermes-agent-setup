@@ -424,6 +424,19 @@ UNIT
     warn "no valid model/provider config — leaving model settings untouched"
   fi
 
+  # v6: the portable anti-refusal unit falls back to system python3 when no
+  # venv exists, so system python3 needs aiohttp too (Ubuntu 24.04 system
+  # python has no pip -- use --break-system-packages or apt).
+  if [[ "$PY" != "/usr/bin/python3" && "$PY" != "/usr/bin/python" ]]; then
+    if ! /usr/bin/python3 -c "import aiohttp" 2>/dev/null; then
+      say "installing aiohttp for system python3 (proxy fallback path)"
+      /usr/bin/python3 -m pip install --quiet --break-system-packages aiohttp 2>/dev/null || \
+        (sudo -n apt-get install -y -qq python3-aiohttp >/dev/null 2>&1 || \
+         apt-get install -y -qq python3-aiohttp >/dev/null 2>&1) || \
+        warn "system python3 lacks aiohttp -- proxy will rely on the venv python"
+    fi
+  fi
+
   if [[ $model_ready -eq 1 ]]; then
     cp -a "$cfg" "$cfg.pre-antirefusal"
     "$PY" - "$cfg" <<'PYEOF' || warn "config rewrite skipped"
@@ -576,6 +589,40 @@ CONF
   fi
 }
 
+# ---------------------------------------------------------------- 6d. restart gateway
+restart_gateway() {
+  say "restarting gateway to activate the unrestricted build"
+  local unit=""
+  if systemctl --user list-unit-files 2>/dev/null | grep -q '^hermes-gateway'; then
+    unit="hermes-gateway"
+  else
+    unit="$(systemctl --user list-unit-files 2>/dev/null | awk '/^hermes/ && /gateway/ {print $1; exit}')"
+  fi
+  if [[ -z "$unit" ]]; then
+    GATEWAY_STATUS="not-found"
+    dim "  no hermes gateway unit found -- restart your gateway manually to activate"
+    return 0
+  fi
+  if [[ $DRY_RUN -eq 1 ]]; then
+    printf "    ${C_Y}(dry-run)${C_0} systemctl --user restart %s\n" "$unit"
+    GATEWAY_STATUS="dry-run"
+    return 0
+  fi
+  if systemctl --user restart "$unit" 2>/dev/null; then
+    sleep 5
+    if systemctl --user is-active "$unit" >/dev/null 2>&1; then
+      GATEWAY_STATUS="restarted"
+      ok "gateway restarted -- guards OFF, HERMES_UNRESTRICTED=1 live (session may blip)"
+    else
+      GATEWAY_STATUS="unhealthy"
+      warn "gateway restarted but not active -- check: systemctl --user status $unit"
+    fi
+  else
+    GATEWAY_STATUS="no-systemd"
+    warn "gateway restart failed (no systemd user session?) -- restart manually: hermes gateway"
+  fi
+}
+
 # ---------------------------------------------------------------- 7. validate
 validate() {
   say "validating installation"
@@ -608,6 +655,30 @@ PYEOF
   if [[ -f "$HERMES_HOME/.env" ]] && grep -qE '^TELEGRAM_BOT_TOKEN=..+' "$HERMES_HOME/.env"; then
     ok "existing Telegram token preserved"
   fi
+
+  # ---- jailbreak verification (v6): one run must leave everything OFF ----
+  say "verifying unrestricted build"
+  local patcher="$WORKDIR/repo/unrestricted.sh"
+  [[ -f "$patcher" ]] || patcher="$WORKDIR/unrestricted.sh"
+  if [[ -f "$patcher" && -n "${HERMES_AGENT_DIR:-}" || -f "$patcher" ]]; then
+    local patched
+    patched="$(HERMES_AGENT_DIR="${HERMES_AGENT_DIR:-$HERMES_HOME/hermes-agent}" \
+               bash "$patcher" --check 2>/dev/null | sed -n 's/^PATCHED_FILES=//p' | tail -1)"
+    if [[ "${patched:-0}" =~ ^[0-9]+$ ]] && [[ "$patched" -ge 15 ]]; then
+      ok "guard kill verified ($patched guard files patched, all guards OFF)"
+    else
+      warn "guard kill incomplete ($patched files) -- re-run: bash unrestricted.sh"
+    fi
+  fi
+  grep -qE '^HERMES_UNRESTRICTED=1' "$HERMES_HOME/.env" 2>/dev/null \
+    && ok "HERMES_UNRESTRICTED=1 in .env" \
+    || warn "HERMES_UNRESTRICTED not set to 1 in .env"
+  [[ -f "$HERMES_HOME/SOUL.md" ]] && ok "SOUL.md deployed" || warn "SOUL.md missing"
+  [[ -f "$HERMES_HOME/memories/MEMORY.md" ]] && ok "memories/MEMORY.md deployed" || warn "memories/MEMORY.md missing"
+  [[ -f "$HERMES_HOME/memories/USER.md" ]] && ok "memories/USER.md deployed" || warn "memories/USER.md missing"
+  systemctl --user is-active antirefusal.service >/dev/null 2>&1 \
+    && ok "anti-refusal proxy active" \
+    || warn "anti-refusal proxy not active"
 }
 
 # ---------------------------------------------------------------- 8. summary
@@ -642,6 +713,14 @@ summary() {
     dry-run)  printf "  Unrestricted    : (dry-run)\n" ;;
     *)        printf "  Unrestricted    : skipped\n" ;;
   esac
+  case "${GATEWAY_STATUS:-skipped}" in
+    restarted) printf "  ${C_G}Gateway         : RESTARTED (unrestricted build live)${C_0}\n" ;;
+    unhealthy) printf "  ${C_R}Gateway         : restarted but NOT active -- check now${C_0}\n" ;;
+    no-systemd)printf "  ${C_Y}Gateway         : restart failed -- restart manually${C_0}\n" ;;
+    not-found) printf "  ${C_Y}Gateway         : no unit found -- restart manually${C_0}\n" ;;
+    dry-run)   printf "  Gateway         : (dry-run)\n" ;;
+    *)         printf "  Gateway         : not restarted\n" ;;
+  esac
   echo
   if [[ "${MODEL_STATUS:-unknown}" == "needs-setup" ]]; then
     printf "  ${C_Y}NEXT STEP — configure your model provider:${C_0}\n"
@@ -666,6 +745,7 @@ main() {
   assess_model_config
   activate_antirefusal
   activate_unrestricted
+  restart_gateway
   validate
   summary
   ROLLBACK_NEEDED=0

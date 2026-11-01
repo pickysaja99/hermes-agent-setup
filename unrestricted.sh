@@ -530,6 +530,7 @@ case "$MODE" in
     printf 'Hermes Unrestricted Patch v2 — STATUS\n'
     printf 'agent dir : %s\n' "$AGENT_DIR"
     printf 'patched   : %s file bertanda\n' "$(count_patched)"
+    printf 'PATCHED_FILES=%s\n' "$(count_patched)"
     for f in $(all_files); do
       if [[ -f "$AGENT_DIR/$f" ]]; then
         if grep -qF "$PATCH_MARKER" "$AGENT_DIR/$f"; then ok "$f"; else warn "$f (belum dipatch)"; fi
