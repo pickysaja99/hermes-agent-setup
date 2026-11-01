@@ -6,7 +6,9 @@
 #  installs the full setup, safely MERGES your existing .env (never loses
 #  secrets), activates the anti-refusal guardrail proxy, and applies the
 #  UNRESTRICTED PATCH (disables every internal guard that could neutralize
-#  SOUL.md / MEMORY.md and sets HERMES_UNRESTRICTED=1 in the Hermes env).
+#  SOUL.md / MEMORY.md, kills the provider content_filter refusal surface,
+#  pins context_file_max_chars so the identity file never truncates, forces
+#  reasoning_effort=none, and sets HERMES_UNRESTRICTED=1 in the Hermes env).
 #  Reports "Auto-refusal: ENABLED" only after the health check passes.
 #
 #  Idempotent: safe to run repeatedly. Rolls back on failure.
@@ -262,6 +264,11 @@ _env_get() {  # key -> value from .env (empty when unset)
 _env_set() {  # key value — replace the line in place, else append
   local k="$1" v="$2" f="$HERMES_HOME/.env" tmp
   [[ -f "$f" ]] || touch "$f"
+  # F3: jangan timpa nilai lama yang VALID dengan string kosong. Cacat lama:
+  # _env_set KEY "" menghapus CUSTOM_API_KEY/CUSTOM_BASE_URL yang terisi.
+  if [[ -z "$v" ]] && grep -qE "^${k}=..+" "$f"; then
+    return 0
+  fi
   if grep -qE "^${k}=" "$f"; then
     tmp="$(mktemp)"
     if awk -v k="$k" -v v="$v" '{ if (!done && index($0, k "=") == 1) { print k "=" v; done = 1 } else print }' "$f" > "$tmp"; then
@@ -500,7 +507,16 @@ configure_upstream() {
     _env_set "$keyenv" "$key"
   fi
   _env_set "ANTIREFUSAL_UPSTREAM" "$base"
-  ok ".env: $keyenv + ANTIREFUSAL_UPSTREAM=$base"
+  # single source of truth: .env utama harus mencerminkan router yang
+  # benar-benar menjawab canary, supaya proxy/watchdog tidak drift ke
+  # upstream lama (onihub) saat model.base_url sudah pindah ke mahi.
+  [[ -n "$key" ]] && _env_set "CUSTOM_BASE_URL" "$base"
+  [[ -n "$key" ]] && _env_set "CUSTOM_API_KEY" "$key"
+  _env_set "ANTIREFUSAL_PORT" "$(grep -E '^ANTIREFUSAL_PORT=' "$HERMES_HOME/.env" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+  ok ".env: $keyenv + ANTIREFUSAL_UPSTREAM=$base (+CUSTOM_BASE_URL/CUSTOM_API_KEY)"
+
+  # .env selalu punya ANTIREFUSAL_PORT (dipakai unit + proxy)
+  grep -qE '^ANTIREFUSAL_PORT=' "$HERMES_HOME/.env" || _env_set "ANTIREFUSAL_PORT" "9200"
 
   if [[ -f "$cfg" ]]; then
     "$PY" - "$cfg" "$base" "$keyenv" "$model" <<'PYEOF' || warn "config.yaml model block tidak ditulis"
@@ -554,14 +570,29 @@ PYEOF
   if [[ -f "$arcfg" ]]; then
     local mf; mf="$(mktemp)"
     printf '%s\n' "$models" > "$mf"
+    # F4: buang SEMUA upstream lama yang router-nya BEDA host dari $host.
+    # Cacat lama: upstream onihub/morku tetap di daftar walau model.base_url
+    # sudah pindah (mis. ke api2.mahicenter.cloud); proxy tetap mencoba
+    # onihub dulu dan watchdog/route nyangkut di sana.
     "$PY" - "$arcfg" "$base" "$keyenv" "$model" "$mf" "$host" <<'PYEOF' || warn "anti-refusal/config.json tidak diupdate"
 import json, sys
+from urllib.parse import urlparse
 p, base, keyenv, model, mf, host = sys.argv[1:7]
 cfg = json.load(open(p))
 models = [l.strip() for l in open(mf) if l.strip()]
+
+def hostof(b):
+    try:
+        return (urlparse(b).hostname or "").lower()
+    except Exception:
+        return ""
+
+want = host.lower()
 ups = [u for u in (cfg.get("upstreams") or []) if isinstance(u, dict)]
-ups = [u for u in ups if u.get("base", "").rstrip("/") != base.rstrip("/")]
-cfg["upstreams"] = [{"name": host, "base": base, "key_env": keyenv}] + ups
+kept = [u for u in ups if u.get("base", "").rstrip("/") != base.rstrip("/")
+        and hostof(u.get("base", "")) == want]
+dropped = [u.get("base") for u in ups if hostof(u.get("base", "")) != want and u.get("base", "").rstrip("/") != base.rstrip("/")]
+cfg["upstreams"] = [{"name": host, "base": base, "key_env": keyenv}] + kept
 cfg["upstream_base_url"] = base
 cfg["upstream_key_env"] = keyenv
 cfg["default_model"] = model
@@ -572,10 +603,11 @@ if models:
             seen.add(m); out.append(m)
     cfg["models"] = out[:64]
 json.dump(cfg, open(p, "w"), indent=2)
-print("   anti-refusal config -> upstream=%s default=%s models=%d" % (base, model, len(cfg.get("models") or [])))
+print("   anti-refusal config -> upstream=%s default=%s models=%d kept=%d dropped=%s"
+      % (base, model, len(cfg.get("models") or []), len(kept), dropped or "none"))
 PYEOF
     rm -f "$mf"
-    ok "anti-refusal/config.json updated"
+    ok "anti-refusal/config.json updated (upstream lama beda-host dibuang)"
   fi
 
   SETUP_MODEL_CHOSEN="$model"
@@ -1019,7 +1051,34 @@ PYEOF
     warn "unrestricted patch reported problems — see output above"
   fi
 
-  # 3. propagate HERMES_UNRESTRICTED=1 to the Hermes gateway service env
+  # 3. harden the DEPLOYED config.yaml (existing configs are preserved by
+  #    install_files, so normalize them here: pin the context-file cap so
+  #    SOUL.md/MEMORY.md never truncate, force reasoning off).
+  local cfg="$HERMES_HOME/config.yaml"
+  if [[ $DRY_RUN -eq 0 && -f "$cfg" && -n "${PY_BIN:-}" ]]; then
+    if "$PY_BIN" - "$cfg" <<'PYEOF' 2>/dev/null
+import io, re, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+orig = s
+if re.search(r'(?m)^context_file_max_chars:', s):
+    s = re.sub(r'(?m)^context_file_max_chars:.*$', 'context_file_max_chars: 400000', s)
+else:
+    s = 'context_file_max_chars: 400000\n' + s
+s = re.sub(r'(?m)^([ \t]*)reasoning_effort:.*$', r'\1reasoning_effort: none', s)
+s = re.sub(r'(?ms)^[ \t]*reasoning_overrides:\n(?:[ \t]+\S.*\n)*', '', s)
+s = re.sub(r'(?m)^  show_reasoning:.*$', '  show_reasoning: false', s)
+io.open(p, "w", encoding="utf-8").write(s) if s != orig else None
+print("hardened" if s != orig else "already")
+PYEOF
+    then
+      ok "deployed config.yaml hardened (context_file_max_chars=400000, reasoning_effort=none)"
+    else
+      warn "config hardening step failed — run: bash unrestricted.sh --stack-only"
+    fi
+  fi
+
+  # 4. propagate HERMES_UNRESTRICTED=1 to the Hermes gateway service env
   local unit_dir="$HOME/.config/systemd/user"
   if [[ -d "$unit_dir" ]] || systemctl --user show-environment >/dev/null 2>&1; then
     mkdir -p "$unit_dir/hermes-gateway.service.d"
@@ -1110,11 +1169,23 @@ PYEOF
     local patched
     patched="$(HERMES_AGENT_DIR="${HERMES_AGENT_DIR:-$HERMES_HOME/hermes-agent}" \
                bash "$patcher" --check 2>/dev/null | sed -n 's/^PATCHED_FILES=//p' | tail -1)"
-    if [[ "${patched:-0}" =~ ^[0-9]+$ ]] && [[ "$patched" -ge 15 ]]; then
+    if [[ "${patched:-0}" =~ ^[0-9]+$ ]] && [[ "$patched" -ge 22 ]]; then
       ok "guard kill verified ($patched guard files patched, all guards OFF)"
     else
       warn "guard kill incomplete ($patched files) -- re-run: bash unrestricted.sh"
     fi
+  fi
+  grep -q '^context_file_max_chars: 400000' "$HERMES_HOME/config.yaml" 2>/dev/null \
+    && ok "context_file_max_chars=400000 (SOUL/MEMORY never truncated)" \
+    || warn "context_file_max_chars not pinned — SOUL.md may truncate"
+  grep -qE '^[[:space:]]*reasoning_effort: none' "$HERMES_HOME/config.yaml" 2>/dev/null \
+    && ok "reasoning_effort: none (thinking disabled)" \
+    || warn "reasoning_effort not 'none' — thinking may stay on"
+  local ttr="$HERMES_HOME/hermes-agent/agent/turn_truncation.py"
+  if [[ -f "$ttr" ]]; then
+    grep -qF 'OPERATOR OVERRIDE (unrestricted build)' "$ttr" \
+      && ok "provider refusal surface disabled (turn_truncation)" \
+      || warn "content_filter refusal surface still active"
   fi
   grep -qE '^HERMES_UNRESTRICTED=1' "$HERMES_HOME/.env" 2>/dev/null \
     && ok "HERMES_UNRESTRICTED=1 in .env" \
@@ -1161,7 +1232,7 @@ summary() {
     *)                printf "  Auto-refusal    : skipped\n" ;;
   esac
   case "${UNRESTRICTED_STATUS:-skipped}" in
-    enabled)  printf "  ${C_G}Unrestricted    : ENABLED (all internal guards disabled)${C_0}\n" ;;
+    enabled)  printf "  ${C_G}Unrestricted    : ENABLED (all guards OFF + refusal surface killed + config hardened)${C_0}\n" ;;
     partial)  printf "  ${C_Y}Unrestricted    : PARTIAL (some patches did not apply)${C_0}\n" ;;
     no-source)printf "  ${C_Y}Unrestricted    : SKIPPED (hermes-agent source not found)${C_0}\n" ;;
     failed)   printf "  ${C_R}Unrestricted    : FAILED${C_0}\n" ;;

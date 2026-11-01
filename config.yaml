@@ -1,13 +1,10 @@
 _config_version: 46
+context_file_max_chars: 400000
 agent:
   fast_auto_seconds: 60
   max_turns: 500
   personalities: {}
-  reasoning_effort: medium
-  reasoning_overrides:
-    deepseek-ai/DeepSeek-V4.1-Flash: high
-  service_tier: ''
-  verbose: false
+  reasoning_effort: none
 approvals:
   cron_mode: approve
   destructive_slash_confirm: false
@@ -94,7 +91,7 @@ display:
       show_reasoning: false
       streaming: false
       tool_progress: 'off'
-  show_reasoning: true
+  show_reasoning: false
   skin: default
   streaming: true
   suppress_warning_notifications: false

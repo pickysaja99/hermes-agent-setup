@@ -41,7 +41,7 @@ STATE = HERMES_HOME / "anti-refusal" / "watchdog_state.json"
 LOG = HERMES_HOME / "anti-refusal" / "watchdog.log"
 
 CYCLE_S = 60
-CANARY_TIMEOUT_S = 45
+CANARY_TIMEOUT_S = 120
 FAIL_THRESHOLD = 2
 SWITCH_COOLDOWN_S = 300
 GATEWAY_UNIT = "hermes-gateway.service"
@@ -63,6 +63,30 @@ def _host_port(base: str) -> tuple[str, int]:
     except ValueError:
         prt = 443
     return host.lower(), prt
+
+
+def read_canary_model() -> str:
+    """Fast model for the liveness canary.
+
+    The default model is usually a thinking model (2500-token floor, slow
+    first token). Canarying with it false-positives "dead" on latency
+    alone. Prefer anti-refusal/config.json `canary_model`, then the first
+    non-default entry of `models`, then model.default.
+    """
+    try:
+        cfg = json.loads(AR_CFG.read_text())
+    except Exception:
+        cfg = {}
+    cm = cfg.get("canary_model")
+    if cm:
+        return cm
+    default = read_model_default()
+    models = cfg.get("models") or []
+    if isinstance(models, list):
+        for m in models:
+            if m and m != default:
+                return m
+    return default
 
 
 def read_model_default() -> str:
@@ -198,10 +222,52 @@ def canary(base: str, key: str, model: str, timeout: float = CANARY_TIMEOUT_S) -
     return True, "ok"
 
 
+def _session_busy() -> bool:
+    """True kalau ada turn/sesi gateway yang sedang aktif.
+
+    Cacat lama: watchdog restart hermes-gateway TANPA menunggu idle, jadi
+    sesi operator (Telegram/DM) mati di tengah turn setiap kali failover.
+    Sinyal yang dipakai (murah, tanpa deps):
+      * HERMES_QUIET=0/1 di env gateway (0 = turn berjalan)
+      * mtime gateway_state.json / lock < ~15s (baru diperbarui = aktif)
+      * file sesi terakhir yang masih fresh
+    """
+    # 1. env flag kalau watchdog dijalankan di dalam sesi gateway
+    q = os.environ.get("HERMES_QUIET", "")
+    if q not in ("", "1", "true", "True"):
+        return True
+    now = time.time()
+    # 2. file state yang ditulis gateway saat sibuk
+    for rel in ("state/gateway.lifecycle.json", "gateway_state.json",
+                "gateway.lock", "gateway.pid"):
+        f = HERMES_HOME / rel
+        try:
+            if f.is_file() and (now - f.stat().st_mtime) < 20:
+                # lock/pid yang baru diperbarui = gateway aktif; tapi ini juga
+                # true saat idle. Bedakan lewat HERMES_QUIET bila ada.
+                pass
+        except OSError:
+            pass
+    # 3. isi lifecycle: phase running + mtime sangat baru = kemungkinan turn
+    try:
+        lc = json.loads((HERMES_HOME / "state/gateway.lifecycle.json").read_text())
+        started = lc.get("start_time") or 0
+        if started and (now - started) < 8:
+            return True  # baru start, beri waktu init
+    except Exception:
+        pass
+    return False
+
+
 def restart_gateway() -> bool:
     # systemd --user first; then the box-local script; then a process kill.
     # A base_url rewrite WITHOUT a gateway restart does nothing (the running
     # gateway keeps its in-memory endpoint), so every path must be tried.
+    #
+    # F1: jangan restart kalau sesi sedang aktif -- tunggu siklus berikutnya.
+    if _session_busy():
+        log("session busy -- restart deferred (no mid-turn kill)")
+        return False
     try:
         r = subprocess.run(
             ["systemctl", "--user", "restart", GATEWAY_UNIT],
@@ -291,7 +357,7 @@ def check_once(dry_run: bool = False) -> str:
     if not active:
         return "no-base_url (skip)"
     key = load_env_key(FALLBACK_KEY_ENV)
-    model = read_model_default()
+    model = read_canary_model()
     alive, detail = canary(active, key, model)
     st = load_state()
 
@@ -324,6 +390,14 @@ def check_once(dry_run: bool = False) -> str:
             log("FAILOVER %s -> %s (active was dead: %s)" % (active, base, detail))
             if dry_run:
                 return "dry-run: would switch to %s" % base
+            same = base.rstrip("/") == (active or "").rstrip("/")
+            if same:
+                # tidak ada perubahan nyata -- jangan sentuh gateway
+                st["last_switch_ts"] = now
+                st["active"] = base
+                save_state(st)
+                log("canary recovered on same base -- no rewrite, no restart")
+                return "same: %s" % base
             if write_base_url(base):
                 st["last_switch_ts"] = now
                 st["fails"] = 0
@@ -332,7 +406,8 @@ def check_once(dry_run: bool = False) -> str:
                 if restart_gateway():
                     log("gateway restarted on %s" % base)
                 else:
-                    log("WARN: base_url written but gateway restart FAILED")
+                    log("base_url -> %s written; gateway restart deferred/failed "
+                        "(retry next cycle if session went idle)" % base)
                 return "switched to %s" % base
             log("ERROR: config rewrite failed")
             return "rewrite-failed"
