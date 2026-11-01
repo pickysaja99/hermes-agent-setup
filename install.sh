@@ -669,7 +669,12 @@ configure_upstream() {
   local have_tty=0
   [[ -t 0 && -c /dev/tty ]] && have_tty=1
 
-  local cur_base cur_keyenv cur_key cur_model
+  # NOTE: every one of these MUST get a default. `local x` leaves x UNSET (not
+  # empty), and with `set -u` any later "$cur_key" on a fresh install (empty
+  # .env, no key_env in config) is an "unbound variable" hard abort -- that is
+  # what killed branch-new installs when the template stopped shipping a
+  # vendor base_url/api_key.
+  local cur_base="" cur_keyenv="" cur_key="" cur_model=""
   cur_base="$(_model_field base_url)"
   cur_keyenv="$(_model_field api_key)"
   cur_keyenv="${cur_keyenv#\$\{}"; cur_keyenv="${cur_keyenv%\}}"
