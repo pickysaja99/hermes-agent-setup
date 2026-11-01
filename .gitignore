@@ -42,3 +42,4 @@ anti-refusal/proxy.log
 
 __pycache__/
 *.pyc
+anti-refusal/probe_out/

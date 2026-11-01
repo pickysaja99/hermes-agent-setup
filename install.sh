@@ -18,6 +18,9 @@
 #     bash install.sh --ref <branch>     # install a specific branch/tag
 #     bash install.sh --dry-run          # show what would happen, change nothing
 #     bash install.sh --no-antirefusal   # skip the auto-refusal stage
+#     bash install.sh --no-restart       # do NOT touch the running gateway/service
+#                                        # (implied automatically whenever HERMES_HOME
+#                                        #  is not the real ~/.hermes -- see _sandboxed)
 #     bash install.sh --no-unrestricted  # skip the guard-disable patch
 #     bash install.sh --help
 #
@@ -38,6 +41,7 @@ WORKDIR=""
 DRY_RUN=0
 DO_ANTIREFUSAL=1
 DO_UNRESTRICTED=1
+DO_RESTART=1
 BACKUP_DIR=""
 STAGE_LOG=""
 ROLLBACK_NEEDED=0
@@ -48,12 +52,46 @@ SETUP_MODEL_CHOSEN=""
 SETUP_BASE_RESOLVED=""
 TELEGRAM_STATUS="unknown"
 
+# A run is SANDBOXED when HERMES_HOME is not the real per-user home. Tests and
+# dry runs point HERMES_HOME at a temp dir -- but `systemctl --user` is GLOBAL,
+# so an unguarded restart would bounce the operator's live gateway (this is
+# exactly what killed an in-flight chat during a sandbox test of this script).
+_real_hermes_home() { printf '%s/.hermes' "$HOME"; }
+
+_sandboxed() {
+  local real; real="$(_real_hermes_home)"
+  [[ "$(readlink -f "$HERMES_HOME" 2>/dev/null || printf '%s' "$HERMES_HOME")" \
+     != "$(readlink -f "$real" 2>/dev/null || printf '%s' "$real")" ]]
+}
+
+# Every service mutation goes through here. Refuses in a sandbox, honours
+# --no-restart, and honours DRY_RUN.
+_svc() {  # verb [unit]
+  if [[ $DRY_RUN -eq 1 ]]; then
+    printf "    ${C_Y}(dry-run)${C_0} systemctl --user %s %s\n" "$1" "${2:-}"
+    return 0
+  fi
+  if _sandboxed; then
+    dim "  [skip] systemctl --user $1 ${2:-} (sandbox: HERMES_HOME != $(_real_hermes_home))"
+    return 0
+  fi
+  if [[ $DO_RESTART -eq 0 ]]; then
+    dim "  [skip] systemctl --user $1 ${2:-} (--no-restart)"
+    return 0
+  fi
+  systemctl --user "$1" ${2:+"$2"}
+}
+
 # ---------------------------------------------------------------- output
 C_R="\033[1;31m"; C_G="\033[1;32m"; C_Y="\033[1;33m"; C_B="\033[1;34m"; C_0="\033[0m"
 say()  { printf "${C_B}[*]${C_0} %s\n" "$*"; }
 ok()   { printf "${C_G}[+]${C_0} %s\n" "$*"; }
 warn() { printf "${C_Y}[!]${C_0} %s\n" "$*"; }
 die()  { printf "${C_R}[x]${C_0} %s\n" "$*" >&2; exit 1; }
+# dim: low-contrast status line. Used by the skip paths (sandbox / --no-restart);
+# it was referenced in 9 places but never defined, so every one of those paths
+# died with "dim: command not found" (exit 127) and triggered a rollback.
+dim()  { printf "  %s\n" "$*"; }
 
 usage() {
   sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
@@ -67,6 +105,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run)        DRY_RUN=1; shift ;;
     --no-antirefusal) DO_ANTIREFUSAL=0; shift ;;
     --no-unrestricted) DO_UNRESTRICTED=0; shift ;;
+    --no-restart) DO_RESTART=0; shift ;;
     -h|--help)        usage ;;
     *) die "unknown option: $1 (use --help)" ;;
   esac
@@ -79,10 +118,21 @@ run() {  # execute a command, or just print it in dry-run
 # ---------------------------------------------------------------- rollback
 rollback() {
   local code=$?
-  [[ $ROLLBACK_NEEDED -eq 1 ]] || return
+  # Re-entrancy guard: `trap ... ERR` fires on ANY non-zero command while
+  # set -e is active, including commands inside rollback itself. Without this
+  # the handler re-entered forever and the installer looped (observed: the log
+  # restarted at "preflight checks" and hung until timeout).
+  if [[ ${_IN_ROLLBACK:-0} -eq 1 ]]; then return; fi
+  _IN_ROLLBACK=1
+  trap - ERR
+  [[ $ROLLBACK_NEEDED -eq 1 ]] || { _IN_ROLLBACK=0; return; }
   printf "\n${C_R}[x] Install failed (exit %s). Rolling back…${C_0}\n" "$code" >&2
-  # stop & remove the unit we may have installed
-  if systemctl --user list-unit-files 2>/dev/null | grep -q '^antirefusal.service'; then
+  # stop & remove the unit we may have installed. Rollback must not disable the
+  # OPERATOR'S live service from a sandbox/--no-restart run: this run never
+  # installed it, so tearing it down would take down the running gateway too.
+  if _sandboxed || [[ $DO_RESTART -eq 0 ]]; then
+    dim "  [skip] service rollback (sandbox or --no-restart)"
+  elif systemctl --user list-unit-files 2>/dev/null | grep -q '^antirefusal.service'; then
     systemctl --user disable --now antirefusal.service >/dev/null 2>&1 || true
     rm -f "$HOME/.config/systemd/user/antirefusal.service" 2>/dev/null || true
     systemctl --user daemon-reload >/dev/null 2>&1 || true
@@ -283,68 +333,120 @@ install_files() {
     if [[ -n "$PYC" && $DRY_RUN -eq 0 ]]; then
       run cp -a "$HERMES_HOME/config.yaml" "$HERMES_HOME/config.yaml.pre-install.$(date +%s)"
       "$PYC" - "$HERMES_HOME/config.yaml" "$S/config.yaml" <<'PYEOF' || warn "config.yaml merge skipped"
-import re, sys
+import sys
 
 dst, tpl = sys.argv[1], sys.argv[2]
-have = open(dst, encoding="utf-8").read()
-want = open(tpl, encoding="utf-8").read()
+have_text = open(dst, encoding="utf-8").read()
+tpl_text = open(tpl, encoding="utf-8").read()
 
-def blocks(text):
-    """top-level key -> its full text block (comment lines above it excluded)."""
-    out, cur, name = {}, [], None
-    for ln in text.splitlines(keepends=True):
-        if ln.strip() and not ln[0].isspace() and not ln.lstrip().startswith("#"):
-            if name:
-                out[name] = "".join(cur)
-            name, cur = ln.split(":", 1)[0].strip(), [ln]
-        elif name:
-            cur.append(ln)
-    if name:
-        out[name] = "".join(cur)
-    return out
+try:
+    import yaml
+except ImportError:
+    print("   PyYAML missing -- config.yaml left untouched")
+    sys.exit(0)
 
-hb, wb = blocks(have), blocks(want)
 
-def model_val(key, text):
-    """value of a key on the model: block at exactly 2-space indent."""
-    m = re.search(r"(?m)^model:\s*$", text)
-    if not m:
-        return None
-    m2 = re.search(r"(?m)^  " + key + r":\s*(.*)$", text[m.end():])
-    if not m2:
-        return None
-    v = m2.group(1).strip()
-    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
-        v = v[1:-1]
-    return v
+class _Dumper(yaml.SafeDumper):
+    """Emit ${ENV} references UNQUOTED.
 
-protected = {k: model_val(k, have) for k in ("base_url", "api_key", "default")}
+    Hermes resolves api_key: ${FOO} from the environment. PyYAML would write
+    '${FOO}' with quotes, the resolver then sees a literal string, and every
+    request 401s with the placeholder as the bearer.
+    """
 
-# Template blocks win wholesale (gateway: included). Only unknown operator
-# sections survive; the three model values are re-applied below.
-merged = dict(wb)
-for k, v in hb.items():
+
+def _env_ref(dumper, data):
+    style = "|" if "\n" in data else None
+    tag = "tag:yaml.org,2002:str"
+    if isinstance(data, str) and data.startswith("${") and data.endswith("}") and " " not in data:
+        return dumper.represent_scalar(tag, data, style=style)
+    return dumper.represent_scalar(tag, data, style=style)
+
+
+_Dumper.add_representer(str, _env_ref)
+
+
+def dump_cfg(doc):
+    return yaml.dump(doc, Dumper=_Dumper, sort_keys=False,
+                     allow_unicode=True, default_flow_style=False, width=4096)
+
+try:
+    have = yaml.safe_load(have_text) or {}
+except Exception as e:
+    # NEVER rewrite a config we cannot parse: a text splice into an unknown
+    # shape is how a valid file gets corrupted ("expected <block end>").
+    print("   existing config.yaml does not parse (%s) -- left untouched" % e)
+    sys.exit(0)
+
+try:
+    want = yaml.safe_load(tpl_text) or {}
+except Exception as e:
+    print("   template config.yaml does not parse (%s) -- left untouched" % e)
+    sys.exit(0)
+
+if not isinstance(have, dict):
+    print("   existing config.yaml is not a mapping -- left untouched")
+    sys.exit(0)
+
+# --- protected operator values -------------------------------------------
+have_model = have.get("model") if isinstance(have.get("model"), dict) else {}
+protected = {k: have_model[k] for k in ("base_url", "api_key", "default") if k in have_model}
+
+# --- template wins for every key; operator-only sections survive ---------
+merged = {}
+for k, v in want.items():
+    merged[k] = v
+for k, v in have.items():
     if k not in merged:
-        merged[k] = v
+        merged[k] = v            # a section the template does not ship
 
-mblk = merged.get("model")
-if mblk:
-    for key, val in protected.items():
-        if val is None:
-            continue
-        if re.search(r"(?m)^  " + key + r":", mblk):
-            mblk = re.sub(r"(?m)^  " + key + r":.*$",
-                          lambda _m, k=key, v=val: "  %s: %s" % (k, v), mblk, count=1)
-        else:
-            mblk = mblk.rstrip("\n") + "\n  %s: %s\n" % (key, val)
-    merged["model"] = mblk
+# custom_providers: UNION, keyed by name (then base_url) so a re-install never
+# drops the operator's own routers. The template's entry wins on conflict.
+def key_of(entry):
+    if isinstance(entry, dict):
+        return entry.get("name") or entry.get("base_url") or str(entry)[:80]
+    return str(entry)[:80]
 
-order = list(wb.keys()) + [k for k in hb.keys() if k not in wb]
-out = "".join(merged[k] for k in order if k in merged)
+if "custom_providers" in want or "custom_providers" in have:
+    t_list = [e for e in (want.get("custom_providers") or []) if isinstance(e, dict)]
+    h_list = [e for e in (have.get("custom_providers") or []) if isinstance(e, dict)]
+    seen, union = set(), []
+    for e in t_list:
+        k = key_of(e)
+        if k not in seen:
+            union.append(e)
+            seen.add(k)
+    for e in h_list:
+        k = key_of(e)
+        if k not in seen:
+            union.append(e)
+            seen.add(k)
+    merged["custom_providers"] = union
+
+# providers: per-provider union too (a dict of named providers)
+if isinstance(want.get("providers"), dict) and isinstance(have.get("providers"), dict):
+    prov = dict(want["providers"])
+    for name, cfg in have["providers"].items():
+        prov.setdefault(name, cfg)
+    merged["providers"] = prov
+
+# --- re-apply the protected model values --------------------------------
+m = merged.get("model")
+if not isinstance(m, dict):
+    m = {}
+    merged["model"] = m
+m.update(protected)
+
+# --- write, then PROVE it parses ----------------------------------------
+out = dump_cfg(merged)
+check = yaml.safe_load(out)
+if not isinstance(check, dict) or check.get("model", {}).get("base_url") != protected.get("base_url", check.get("model", {}).get("base_url")):
+    print("   merge result failed self-check -- config.yaml left untouched")
+    sys.exit(0)
 open(dst, "w", encoding="utf-8").write(out)
-kept = [k for k, v in protected.items() if v]
-print("   config.yaml: template applied (gateway: too); preserved %s"
-      % ", ".join("model." + k for k in kept))
+kept = ", ".join("model." + k for k in protected)
+print("   config.yaml: template applied; preserved %s%s" % (
+    kept or "(nothing)", "; custom_providers merged" if union else ""))
 PYEOF
     fi
     ok "config.yaml converged to template; base_url/api_key/model preserved"
@@ -683,132 +785,120 @@ configure_upstream() {
   grep -qE '^ANTIREFUSAL_PORT=' "$HERMES_HOME/.env" || _env_set "ANTIREFUSAL_PORT" "9200"
 
   if [[ -f "$cfg" ]]; then
-    "$PY" - "$cfg" "$base" "$keyenv" "$model" "$host" <<'PYEOF' || warn "config.yaml model block tidak ditulis"
-import re, sys
+        "$PY" - "$cfg" "$base" "$keyenv" "$model" "$host" <<'PYEOF' || warn "config.yaml model block tidak ditulis"
+import sys
+
 p, base, keyenv, model, host = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
-lines = open(p, encoding="utf-8").read().splitlines(keepends=True)
-mi = next((i for i, l in enumerate(lines) if re.match(r"^model:\s*(#.*)?$", l)), None)
-if mi is None:
-    if lines and not lines[-1].endswith("\n"):
-        lines[-1] += "\n"
-    lines.append("\nmodel:\n")
-    mi = len(lines) - 1
-end = mi + 1
-while end < len(lines):
-    l = lines[end]
-    if l.strip() and not l[0].isspace():
-        break
-    end += 1
-block = lines[mi + 1:end]
-indent = 2
-for l in block:
-    if l.strip():
-        indent = len(l) - len(l.lstrip())
-        break
+
+try:
+    import yaml
+except ImportError:
+    print("   PyYAML missing -- config.yaml left untouched")
+    sys.exit(0)
+
+
+class _Dumper(yaml.SafeDumper):
+    """Emit ${ENV} references UNQUOTED.
+
+    Hermes resolves api_key: ${FOO} from the environment. PyYAML would write
+    '${FOO}' with quotes, the resolver then sees a literal string, and every
+    request 401s with the placeholder as the bearer.
+    """
+
+
+def _env_ref(dumper, data):
+    style = "|" if "\n" in data else None
+    tag = "tag:yaml.org,2002:str"
+    if isinstance(data, str) and data.startswith("${") and data.endswith("}") and " " not in data:
+        return dumper.represent_scalar(tag, data, style=style)
+    return dumper.represent_scalar(tag, data, style=style)
+
+
+_Dumper.add_representer(str, _env_ref)
+
+
+def dump_cfg(doc):
+    return yaml.dump(doc, Dumper=_Dumper, sort_keys=False,
+                     allow_unicode=True, default_flow_style=False, width=4096)
+
+try:
+    doc = yaml.safe_load(open(p, encoding="utf-8").read()) or {}
+except Exception as e:
+    # Never text-splice into a file we cannot parse: that is how a valid
+    # config.yaml got corrupted ("expected <block end>, but found '-'").
+    print("   config.yaml does not parse (%s) -- left untouched" % e)
+    sys.exit(0)
+
+if not isinstance(doc, dict):
+    print("   config.yaml is not a mapping -- left untouched")
+    sys.exit(0)
+
 
 def quote(v):
-    # ${ENV} references must stay UNQUOTED: PyYAML keeps single quotes literal,
-    # so api_key: '${FOO}' sends the literal text as the bearer and every
-    # request 401s. Only plain scalars that YAML cannot misread are bare.
-    if re.fullmatch(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}", v):
-        return v
-    return v if re.fullmatch(r"[A-Za-z0-9_./@-]+", v) else "'%s'" % v.replace("'", "''")
-
-def setkv(key, val):
-    pat = re.compile(r"^(\s+)" + re.escape(key) + r"\s*:")
-    for j, l in enumerate(block):
-        m = pat.match(l)
-        if m and len(m.group(1)) == indent:
-            block[j] = "%s%s: %s\n" % (" " * indent, key, val)
-            return
-    block.insert(0, "%s%s: %s\n" % (" " * indent, key, val))
-
-def toplevel():
-    """(start, end) line span of each top-level block in the document."""
-    spans, i = {}, 0
-    while i < len(lines):
-        l = lines[i]
-        if l.strip() and not l[0].isspace() and not l.lstrip().startswith("#"):
-            key = l.split(":", 1)[0].strip()
-            j = i + 1
-            while j < len(lines):
-                n = lines[j]
-                if n.strip() and not n[0].isspace() and not n.lstrip().startswith("#"):
-                    break
-                j += 1
-            spans[key] = (i, j)
-            i = j
-        else:
-            i += 1
-    return spans
+    """${ENV} references must stay UNQUOTED: PyYAML keeps quotes literal, and
+    the gateway would then send the text '${FOO}' as the bearer (every 401)."""
+    return str(v)
 
 
-spans = toplevel()
-prov = spans.get("providers")
-seed = [
-    "providers:\n",
-    "  custom:\n",
-    "    base_url: %s\n" % quote(base),
-    "    api_key: %s\n" % quote("${%s}" % keyenv),
-    "    api_mode: chat_completions\n",
-    "    model: %s\n" % quote(model),
-]
-if prov:
-    blk = lines[prov[0]:prov[1]]
-    if not any(l.startswith("  custom:") for l in blk):
-        # add the custom provider at the END of the existing block
-        blk = blk[0:1] + blk[1:] + seed[1:]
-        lines[prov[0]:prov[1]] = blk
-    # an existing custom: provider is preserved verbatim -- never overwritten
-elif "model" in spans:
-    k = spans["model"][1]
-    if k and not lines[k - 1].endswith("\n"):
-        lines[k - 1] += "\n"
-    lines[k:k] = seed
-    spans = toplevel()
+mdl = doc.get("model")
+if not isinstance(mdl, dict):
+    mdl = {}
+    doc["model"] = mdl
+mdl["base_url"] = quote(base)
+mdl["api_key"] = "${%s}" % keyenv
+mdl["default"] = quote(model)
+mdl["provider"] = "custom"
+mdl["api_mode"] = "chat_completions"
 
-# custom_providers (the operator's saved router list: name/base_url/key_env/
-# model). A re-run must ADD the current router when it is absent and keep
-# every other entry — wiping this list is the "configurasi gateway/model
-# hilang setelah install" bug.
-cp = spans.get("custom_providers")
-ENTRY = ["  - name: %s\n" % quote(host or base),
-         "    base_url: %s\n" % quote(base),
-         "    key_env: %s\n" % keyenv,
-         "    model: %s\n" % quote(model)]
+# providers.custom mirrors the router; every other provider is preserved.
+prov = doc.get("providers")
+if not isinstance(prov, dict):
+    prov = {}
+    doc["providers"] = prov
+custom = prov.get("custom")
+if not isinstance(custom, dict):
+    custom = {}
+custom.update({
+    "base_url": base,
+    "api_key": "${%s}" % keyenv,
+    "api_mode": "chat_completions",
+    "model": model,
+})
+prov["custom"] = custom
+
+# custom_providers: ADD this router when absent, keep every other entry.
+cps = doc.get("custom_providers")
+if not isinstance(cps, list):
+    cps = []
+cps = [e for e in cps if isinstance(e, dict)]
 
 
-def cp_has(blk):
-    """True when the router is already listed — indentation/quote-insensitive
-    (a `"    base_url: x"` vs `base_url: 'x'` mismatch duplicated the entry
-    on every re-run)."""
-    for l in blk:
-        if l.strip().startswith("- name:"):
-            if l.split("name:", 1)[1].strip().strip("'\"") == (host or base):
-                return True
-        if "base_url:" in l and l.split("base_url:", 1)[1].strip().strip("'\"").rstrip("/") == base.rstrip("/"):
-            return True
-    return False
+def matches(entry):
+    if str(entry.get("name", "")).strip() == (host or base):
+        return True
+    return str(entry.get("base_url", "")).rstrip("/") == base.rstrip("/")
 
 
-if cp:
-    blk = lines[cp[0]:cp[1]]
-    if not cp_has(blk):
-        if not blk[-1].endswith("\n"):
-            blk[-1] += "\n"
-        blk = blk + ENTRY
-        lines[cp[0]:cp[1]] = blk
-else:
-    k = spans["model"][1] if "model" in spans else len(lines)
-    lines[k:k] = ["custom_providers:\n"] + ENTRY
+if not any(matches(e) for e in cps):
+    cps.append({"name": host or base, "base_url": base,
+                "key_env": keyenv, "model": model})
+doc["custom_providers"] = cps
 
-setkv("base_url", quote(base))
-setkv("api_key", quote("${%s}" % keyenv))
-setkv("default", quote(model))
-setkv("provider", "custom")
-setkv("api_mode", "chat_completions")
-lines[mi + 1:end] = block
-open(p, "w", encoding="utf-8").write("".join(lines))
+# --- serialise, then PROVE the result round-trips and keeps ${ENV} bare ----
+out = dump_cfg(doc)
+if "${%s}" % keyenv not in out:
+    print("   serialisation dropped the ${ENV} api_key -- left untouched")
+    sys.exit(0)
+try:
+    back = yaml.safe_load(out)
+except Exception as e:
+    print("   merged YAML does not re-parse (%s) -- left untouched" % e)
+    sys.exit(0)
+if back.get("model", {}).get("base_url") != base:
+    print("   merged YAML lost base_url -- left untouched")
+    sys.exit(0)
+
+open(p, "w", encoding="utf-8").write(out)
 print("   model block -> base_url=%s default=%s" % (base, model))
 PYEOF
     ok "config.yaml: base_url=$base default=$model"
@@ -913,12 +1003,27 @@ ensure_telegram_token() {
 
 # ---------------------------------------------------------------- 5. python for proxy
 find_python() {
-  # prefer the hermes venv python, else system python3
+  # Prefer a python that can import yaml: the config.yaml merge and the YAML
+  # validation are no-ops on a python without PyYAML, and a text-splice fallback
+  # corrupts an otherwise valid config (observed: "expected <block end>").
   local cands=(
     "$HERMES_HOME/hermes-agent/venv/bin/python3"
+    "${HERMES_PYTHON:-}"
     "$(command -v python3 2>/dev/null || true)"
     /usr/bin/python3
   )
+  # hermes toolchain pythons ship PyYAML
+  local t
+  for t in "$HOME"/.hermes/tools/python*/bin/python3; do
+    [[ -x "$t" ]] && cands+=("$t")
+  done
+  local c
+  for c in "${cands[@]}"; do
+    [[ -n "$c" && -x "$c" ]] || continue
+    if "$c" -c 'import yaml' >/dev/null 2>&1; then echo "$c"; return 0; fi
+  done
+  # no yaml-capable python: return the first usable one so callers can still
+  # print a clear "PyYAML missing" message instead of corrupting the file.
   for c in "${cands[@]}"; do
     [[ -n "$c" && -x "$c" ]] && { echo "$c"; return 0; }
   done
@@ -1125,8 +1230,13 @@ UNIT
   # -- start the service: prefer systemd --user, else fall back to a plain
   #    background process (many VPS/containers have no systemd user session).
   local started=0
-  if systemctl --user daemon-reload 2>/dev/null && \
-     systemctl --user show-environment >/dev/null 2>&1; then
+  if _sandboxed || [[ $DO_RESTART -eq 0 ]]; then
+    # A sandbox/--no-restart run must not touch the operator's services. Probe
+    # the already-running proxy instead of (re)starting anything.
+    dim "  [skip] antirefusal.service start (sandbox or --no-restart)"
+    started=1
+  elif systemctl --user daemon-reload 2>/dev/null && \
+       systemctl --user show-environment >/dev/null 2>&1; then
     systemctl --user enable antirefusal.service >/dev/null 2>&1 || true
     if systemctl --user restart antirefusal.service >/dev/null 2>&1 || \
        systemctl --user start antirefusal.service >/dev/null 2>&1; then
@@ -1179,24 +1289,26 @@ UNIT
           "$PY" - "$cfg" "$ar_port" <<'PYEOF' || warn "config rewrite skipped"
 import sys
 p, port = sys.argv[1], sys.argv[2]
-lines = open(p).read().splitlines(keepends=True)
-out, in_model, done = [], False, False
-for ln in lines:
-    stripped = ln.strip()
-    if stripped.startswith("model:"):
-        in_model = True
-        out.append(ln); continue
-    if in_model and not ln[:1].isspace() and stripped:
-        in_model = False            # left the model block
-    if in_model and ln.startswith("  base_url:") and not done:
-        # exact 2-space indent: the model block's OWN base_url, never a
-        # nested alias/provider entry (those sit at 4+ spaces)
-        out.append(f"  base_url: http://127.0.0.1:{port}/v1\n")
-        done = True
-        continue
-    out.append(ln)
-open(p, "w").write("".join(out))
-print("model.base_url -> proxy" if done else "no change")
+try:
+    import yaml
+except ImportError:
+    print("   PyYAML missing -- model.base_url left unchanged")
+    sys.exit(0)
+try:
+    doc = yaml.safe_load(open(p, encoding="utf-8").read()) or {}
+except Exception as e:
+    print("   config.yaml unparsable (%s) -- left unchanged" % e)
+    sys.exit(0)
+if not isinstance(doc, dict) or not isinstance(doc.get("model"), dict):
+    print("   no model: block -- left unchanged")
+    sys.exit(0)
+doc["model"]["base_url"] = "http://127.0.0.1:%s/v1" % port
+out = dump_cfg(doc)
+if yaml.safe_load(out).get("model", {}).get("base_url") != doc["model"]["base_url"]:
+    print("   self-check failed -- left unchanged")
+    sys.exit(0)
+open(p, "w", encoding="utf-8").write(out)
+print("model.base_url -> proxy")
 PYEOF
         else
           warn "proxy canary failed on 127.0.0.1:${ar_port} — model.base_url left on the direct upstream"
@@ -1239,7 +1351,9 @@ RestartSec=10
 [Install]
 WantedBy=default.target
 UNIT
-    if systemctl --user daemon-reload 2>/dev/null; then
+    if _sandboxed || [[ $DO_RESTART -eq 0 ]]; then
+      dim "  [skip] watchdog service (sandbox or --no-restart)"
+    elif systemctl --user daemon-reload 2>/dev/null; then
       systemctl --user enable hermes-endpoint-watchdog.service >/dev/null 2>&1 || true
       if systemctl --user restart hermes-endpoint-watchdog.service >/dev/null 2>&1; then
         ok "endpoint watchdog enabled (auto-failover model.base_url)"
@@ -1343,7 +1457,9 @@ PYEOF
 
   # 4. propagate HERMES_UNRESTRICTED=1 to the Hermes gateway service env
   local unit_dir="$HOME/.config/systemd/user"
-  if [[ -d "$unit_dir" ]] || systemctl --user show-environment >/dev/null 2>&1; then
+  if _sandboxed || [[ $DO_RESTART -eq 0 ]]; then
+    dim "  [skip] gateway service drop-in (sandbox or --no-restart)"
+  elif [[ -d "$unit_dir" ]] || systemctl --user show-environment >/dev/null 2>&1; then
     mkdir -p "$unit_dir/hermes-gateway.service.d"
     cat > "$unit_dir/hermes-gateway.service.d/unrestricted.conf" <<'CONF'
 [Service]
@@ -1357,6 +1473,20 @@ CONF
 # ---------------------------------------------------------------- 6d. restart gateway
 restart_gateway() {
   say "restarting gateway to activate the unrestricted build"
+  # NEVER bounce a gateway this run did not configure. In a sandbox (HERMES_HOME
+  # != ~/.hermes) or under --no-restart, restarting is both pointless and
+  # destructive: `systemctl --user restart hermes-gateway` is GLOBAL, so a test
+  # run killed the operator's live chat session.
+  if _sandboxed; then
+    GATEWAY_STATUS="skipped-sandbox"
+    dim "  [skip] gateway restart (sandbox run: HERMES_HOME=$HERMES_HOME)"
+    return 0
+  fi
+  if [[ $DO_RESTART -eq 0 ]]; then
+    GATEWAY_STATUS="skipped-no-restart"
+    dim "  [skip] gateway restart (--no-restart)"
+    return 0
+  fi
   local unit=""
   if systemctl --user list-unit-files 2>/dev/null | grep -q '^hermes-gateway'; then
     unit="hermes-gateway"
@@ -1390,6 +1520,10 @@ restart_gateway() {
 
 # ---------------------------------------------------------------- 7. validate
 validate() {
+  # Validation never changes state and must never roll the install back: a
+  # missing optional piece is a warning, not an install failure. Disable the
+  # ERR trap for the duration so a non-zero probe cannot abort the run.
+  trap - ERR
   say "validating installation"
   [[ $DRY_RUN -eq 1 ]] && { printf "    ${C_Y}(dry-run)${C_0} validate YAML + structure\n"; return; }
 
@@ -1431,7 +1565,7 @@ PYEOF
   if [[ -f "$patcher" && -n "${HERMES_AGENT_DIR:-}" || -f "$patcher" ]]; then
     local patched
     patched="$(HERMES_AGENT_DIR="${HERMES_AGENT_DIR:-$HERMES_HOME/hermes-agent}" \
-               bash "$patcher" --check 2>/dev/null | sed -n 's/^PATCHED_FILES=//p' | tail -1)"
+               bash "$patcher" --check 2>/dev/null | sed -n 's/^PATCHED_FILES=//p' | tail -1)" || true
     if [[ "${patched:-0}" =~ ^[0-9]+$ ]] && [[ "$patched" -ge 22 ]]; then
       ok "guard kill verified ($patched guard files patched, all guards OFF)"
     else
