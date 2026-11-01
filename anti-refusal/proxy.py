@@ -31,8 +31,10 @@ def load_cfg():
 
 
 CFG = load_cfg()
-PORT = CFG.get("port", 9200)
-UPSTREAM = CFG["upstream_base_url"].rstrip("/")
+PORT = int(os.environ.get("ANTIREFUSAL_PORT", CFG.get("port", 9200)))
+UPSTREAM = (os.environ.get("ANTIREFUSAL_UPSTREAM")
+            or CFG.get("upstream_base_url")
+            or "https://token.lightvela.ai/v1").rstrip("/")
 MAX_ATTEMPTS = int(CFG.get("max_attempts", 3))
 TIMEOUT = int(CFG.get("upstream_timeout", 90))
 INJECT_LIGHT = bool(CFG.get("inject_light", True))

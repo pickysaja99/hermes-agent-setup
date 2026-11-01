@@ -57,26 +57,38 @@ CUSTOM_BASE_URL=https://token.lightvela.ai/v1
 TELEGRAM_BOT_TOKEN=123456...
 ```
 
-Pick your model in `config.yaml` under `model:` — it points at a local proxy by default
-(`http://127.0.0.1:9200/v1`). If you don't want the proxy, point `model.base_url`
-directly at your LLM endpoint.
+Pick your model in `config.yaml` under `model:`. The default ships pointing at a
+**valid, reachable** OpenAI-compatible endpoint (`https://token.lightvela.ai/v1`)
+so nothing errors on a fresh install — set `CUSTOM_API_KEY` + `CUSTOM_BASE_URL`
+in `.env` to your own router. No unresolvable placeholder hosts are shipped.
 
 ### Anti-refusal proxy (optional)
 
 `anti-refusal/proxy.py` is a tiny aiohttp guardrail: it forwards
 `/v1/chat/completions` to your upstream, detects refusal patterns (EN + zh), and
 re-asks up to `max_attempts` times with escalating anti-refusal system lines.
+It listens on `127.0.0.1:9200`.
+
+The easy path is the bundled installer (`install.sh`), which copies the folder,
+installs a **portable** systemd unit, rewrites the upstream from your `.env`, and
+only reports `Auto-refusal: ENABLED` after the proxy health check passes.
+
+Manual run:
 
 ```bash
 # run it
 python3 ~/.hermes/anti-refusal/proxy.py   # listens on 127.0.0.1:9200
 
-# or as a service
-sudo cp ~/.hermes/anti-refusal/antirefusal.service /etc/systemd/system/
-sudo systemctl enable --now antirefusal
+# or as a user service (portable unit, uses %h)
+cp ~/.hermes/anti-refusal/antirefusal.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now antirefusal
 ```
 
-Edit `anti-refusal/config.json` to change upstream, retry count, or port.
+Edit `anti-refusal/config.json` (or set `ANTIREFUSAL_UPSTREAM`) to change
+upstream, retry count, or port. For auto-refusal to sit in the request path,
+point `model.base_url` at `http://127.0.0.1:9200/v1` — the installer does this
+for you during activation.
 
 ## Run
 

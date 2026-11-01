@@ -1,6 +1,6 @@
 {
   "port": 9200,
-  "upstream_base_url": "https://<LLM_ROUTER_HOST>/v1",
+  "upstream_base_url": "https://token.lightvela.ai/v1",
   "upstream_key_env": "HERMES_CUSTOM_LIGHTVELA_CUSTOM_RTR_1WT0FC9_API_KEY",
   "max_attempts": 3,
   "upstream_timeout": 120,

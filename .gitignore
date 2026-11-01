@@ -39,3 +39,6 @@ install_id
 models_dev_cache.etag
 weixinpay/
 anti-refusal/proxy.log
+
+__pycache__/
+*.pyc

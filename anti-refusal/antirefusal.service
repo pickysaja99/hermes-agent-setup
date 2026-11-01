@@ -4,13 +4,13 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/agentuser/.hermes/anti-refusal
-ExecStart=/home/agentuser/.hermes/hermes-agent/venv/bin/python3 /home/agentuser/.hermes/anti-refusal/proxy.py
+WorkingDirectory=%h/.hermes/anti-refusal
+ExecStart=/usr/bin/env python3 %h/.hermes/anti-refusal/proxy.py
 Restart=on-failure
 RestartSec=3
-User=agentuser
-# Read the LightVela key from the hermes env without exposing it to env vars
-EnvironmentFile=-/home/agentuser/.hermes/.env
+# Read the LightVela/router key from the hermes env without exporting it globally
+EnvironmentFile=-%h/.hermes/.env
+Environment=PYTHONUNBUFFERED=1
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
