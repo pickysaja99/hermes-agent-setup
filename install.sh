@@ -342,6 +342,13 @@ activate_antirefusal() {
   fi
   [[ -z "$upstream" ]] && upstream="https://token.lightvela.ai/v1"
 
+  # listen port: allow override from .env (default 9200)
+  local ar_port="9200"
+  if [[ -f "$HERMES_HOME/.env" ]]; then
+    local p; p="$(grep -E '^ANTIREFUSAL_PORT=' "$HERMES_HOME/.env" | tail -1 | cut -d= -f2- || true)"
+    [[ -n "$p" ]] && ar_port="$p"
+  fi
+
   if [[ $DRY_RUN -eq 1 ]]; then
     printf "    ${C_Y}(dry-run)${C_0} install user unit, upstream=%s, verify /health\n" "$upstream"
     return 0
@@ -378,6 +385,7 @@ RestartSec=3
 EnvironmentFile=-$HERMES_HOME/.env
 Environment=PYTHONUNBUFFERED=1
 Environment=ANTIREFUSAL_UPSTREAM=$upstream
+Environment=ANTIREFUSAL_PORT=$ar_port
 
 [Install]
 WantedBy=default.target
@@ -433,7 +441,7 @@ PYEOF
   for tries in 1 2 3 4 5 6 7 8; do
     sleep 1
     local body
-    body="$(curl -fsS --max-time 3 http://127.0.0.1:9200/health 2>/dev/null || true)"
+    body="$(curl -fsS --max-time 3 "http://127.0.0.1:${ar_port}/health" 2>/dev/null || true)"
     if printf '%s' "$body" | grep -q '"ok"[[:space:]]*:[[:space:]]*true'; then
       healthy=1; break
     fi
@@ -442,7 +450,7 @@ PYEOF
   if [[ $healthy -eq 1 ]]; then
     local keyed
     keyed="$(printf '%s' "$body" | grep -o '"key"[[:space:]]*:[[:space:]]*true' || true)"
-    ok "proxy healthy on 127.0.0.1:9200"
+    ok "proxy healthy on 127.0.0.1:${ar_port}"
     if [[ -n "$keyed" ]]; then
       ok "Auto-refusal: ENABLED (upstream key present)"
     else

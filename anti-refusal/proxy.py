@@ -15,7 +15,10 @@ from aiohttp import web
 
 HERE = Path(__file__).resolve().parent
 CFG_PATH = HERE / "config.json"
-HERMES_ENV = Path.home() / ".hermes" / ".env"
+# .env lives one level up from anti-refusal/ (i.e. $HERMES_HOME/.env). Allow an
+# explicit override so the proxy works under any install root / sandbox.
+_env_override = os.environ.get("HERMES_ENV")
+HERMES_ENV = Path(_env_override) if _env_override else (HERE.parent / ".env")
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s",
@@ -41,19 +44,32 @@ INJECT_LIGHT = bool(CFG.get("inject_light", True))
 
 # --- upstream API key: reuse the LightVela RTR key from ~/.hermes/.env ---
 def read_upstream_key():
+    # 1) explicit override
+    for env_name in ("ANTIREFUSAL_KEY",):
+        v = os.environ.get(env_name)
+        if v:
+            return v.strip()
+    # 2) the configured key_env name
     if CFG.get("upstream_key_env"):
         envv = os.environ.get(CFG["upstream_key_env"])
         if envv:
             return envv.strip()
+    # 3) parse $HERMES_HOME/.env
+    wanted = CFG.get("upstream_key_env") or ""
     try:
         for line in HERMES_ENV.read_text().splitlines():
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, _, v = line.partition("=")
-            k = k.strip()
-            if k in ("HERMES_CUSTOM_LIGHTVELA_CUSTOM_RTR_1WT0FC9_API_KEY",) or k.endswith("_RTR_1WT0FC9_API_KEY"):
-                return v.strip()
+            k, v = k.strip(), v.strip()
+            if not v:
+                continue
+            if wanted and k == wanted:
+                return v
+            # generic fallbacks so any router key works, not just the LightVela one
+            if k in ("ANTIREFUSAL_KEY", "CUSTOM_API_KEY") or k.endswith("_API_KEY"):
+                return v
     except Exception as e:
         log.warning("cannot read .env: %s", e)
     return ""
