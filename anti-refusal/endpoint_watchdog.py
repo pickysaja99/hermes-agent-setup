@@ -171,6 +171,34 @@ def _norm_url(b: str) -> str:
     return (b or "").rstrip("/").lower()
 
 
+def _is_direct(base: str) -> bool:
+    """True when base_url is NOT the guardrail proxy.
+
+    Any endpoint that is not the local proxy means the refusal ladder,
+    laundering net and input reframing are all out of the loop, so the
+    watcher treats "on direct" as a state to leave as soon as the proxy is
+    healthy again.
+    """
+    return _norm_url(base) != _norm_url(PROXY_BASE)
+
+
+def proxy_probe(timeout: float = 8.0) -> tuple[bool, str]:
+    """Cheap liveness check on the proxy itself, independent of the ladder.
+
+    /health is deliberately used instead of a canary chat: the point is to
+    know whether the process is up and answering, not whether an upstream is
+    currently refusing. A proxy that is up but whose upstream is dead must
+    still be restored -- it can fail over internally, which direct cannot.
+    """
+    try:
+        port = _host_port(PROXY_BASE)[1]
+        with urllib.request.urlopen("http://127.0.0.1:%d/health" % port,
+                                    timeout=timeout) as r:
+            return r.status == 200, "HTTP %s" % r.status
+    except Exception as e:
+        return False, repr(e)
+
+
 def log(msg: str) -> None:
     line = "%s %s\n" % (time.strftime("%m-%d %H:%M:%S"), msg)
     with open(LOG, "a") as f:
@@ -446,6 +474,28 @@ def check_once(dry_run: bool = False) -> str:
         st["fails"] = 0
         st["active"] = active
         save_state(st)
+        # Return to the guardrail. Failover legitimately bypasses the proxy
+        # when it is dead, but nothing used to move back: once the config
+        # pointed at DIRECT it stayed there forever, silently dropping refusal
+        # detection, the retry ladder and input reframing. Being on direct is
+        # a temporary escape hatch, not a destination.
+        if _is_direct(active) and not dry_run:
+            pb = proxy_probe()
+            if pb[0]:
+                now = time.time()
+                if now - st.get("last_switch_ts", 0.0) >= SWITCH_COOLDOWN_S:
+                    if write_base_url(PROXY_BASE):
+                        st["last_switch_ts"] = now
+                        st["active"] = PROXY_BASE
+                        save_state(st)
+                        if restart_gateway():
+                            log("guardrail RESTORED: direct -> %s" % PROXY_BASE)
+                        else:
+                            log("guardrail base_url restored; gateway restart "
+                                "deferred (retry next cycle)")
+                        return "restored: %s" % PROXY_BASE
+                else:
+                    log("proxy healthy but cooldown active — restore deferred")
         return "alive: %s" % active
 
     st["fails"] = st.get("fails", 0) + 1
