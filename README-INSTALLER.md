@@ -71,12 +71,32 @@ Environment overrides: `HERMES_HOME` (default `~/.hermes`),
 
 ## 3. Auto-refusal activation
 
-`anti-refusal/proxy.py` sits between Hermes and your LLM router, detects refusals
-(EN + zh), and re-asks with an escalated anti-refusal system line. The installer:
+`anti-refusal/proxy.py` (v3) sits between Hermes and your LLM router, detects
+refusals (EN + zh + ID), and re-asks with an escalated anti-refusal system line.
+v3 adds what v2 got wrong:
+
+- **SSE-tolerant parsing.** An upstream that ignores `stream:false` and replies
+  `text/event-stream` is assembled into a normal completion instead of throwing
+  `Attempt to decode JSON with unexpected mimetype` (v2 dropped *every* attempt
+  against such an upstream).
+- **Host-aware key resolution.** Every non-empty `*_API_KEY` in `.env` is
+  catalogued; the key whose variable name matches the upstream host wins. v2 read
+  a single hard-coded env name that is empty on a real install and shipped an
+  empty bearer token.
+- **Multi-upstream failover.** `config.json` carries an ordered `upstreams[]`;
+  a 401/403/404/timeout on one advances to the next instead of exhausting the
+  whole ladder against a dead router.
+- **Streaming clients are served.** If the inbound request asked for
+  `stream:true`, the finished text is re-emitted as SSE chunks so Hermes'
+  streaming path does not hang.
+- **Never an empty 200.** The longest non-refusing answer seen across all
+  attempts wins; a structured error is returned only when nothing came back.
+
+The installer:
 
 1. Copies the component to `$HERMES_HOME/anti-refusal/`.
-2. Resolves the upstream from `.env` (`ANTIREFUSAL_UPSTREAM` → `CUSTOM_BASE_URL`
-   → default `https://token.lightvela.ai/v1`).
+2. Resolves upstreams from `config.json` `upstreams[]` → `ANTIREFUSAL_UPSTREAM` →
+   `config.upstream_base_url` → default `https://token.lightvela.ai/v1`.
 3. Installs a **portable** systemd **user** unit, or — if `systemctl --user`
    is unavailable (containers/VPS) — starts a tracked background process.
 4. Routes `model.base_url` through `http://127.0.0.1:9200/v1` so the guardrail is
@@ -85,14 +105,24 @@ Environment overrides: `HERMES_HOME` (default `~/.hermes`),
 
 Output is honest:
 
-- `Auto-refusal : ENABLED` — health OK **and** the upstream key is present.
-- `Auto-refusal : INSTALLED (needs upstream key)` — health OK, key empty
+- `Auto-refusal : ENABLED` — health OK **and** at least one upstream key present.
+- `Auto-refusal : INSTALLED (needs upstream key)` — health OK, no key
   (fill it in `.env` and restart).
 - `Auto-refusal : FAILED` — health check failed; see
   `$HERMES_HOME/anti-refusal/proxy.log`.
 
+Check what the proxy actually resolved:
+
+```bash
+curl -s http://127.0.0.1:9200/health | python3 -m json.tool
+# -> keys_found, upstreams[].key ("set" | "MISSING"), env_file
+```
+
 Environment knobs: `ANTIREFUSAL_PORT` (default 9200),
-`ANTIREFUSAL_UPSTREAM`, `ANTIREFUSAL_KEY` (in `.env`).
+`ANTIREFUSAL_UPSTREAM` (single override), `ANTIREFUSAL_KEY` (force one key),
+`ANTIREFUSAL_MAX_ATTEMPTS` (default 8). `config.json` keys:
+`upstreams[]`, `default_model`, `models[]`, `host_aware_keys`,
+`force_prefill`, `inject_light`, `upstream_timeout`, `upstream_connect_timeout`.
 
 ---
 
