@@ -399,32 +399,41 @@ run_extra_patches() {
 import io, sys
 p, mark = sys.argv[1], sys.argv[2]
 s = io.open(p, encoding="utf-8").read()
-s = s.replace(
+# Verify EACH replace landed. str.replace() is a silent no-op on a missing
+# anchor and the old code wrote the file back and printed [ok] anyway, so a
+# renamed anchor upstream left the guard ACTIVATED while reporting success.
+_hits = 0
+
+def rep(old, new):
+    global s, _hits
+    if old not in s:
+        raise SystemExit("  [FAIL] anchor tidak ditemukan (file TIDAK ditulis): %r" % old[:60])
+    s = s.replace(old, new, 1)
+    _hits += 1
+
+rep(
     "    hermes_config = _get_hermes_config_resolved()\n    if hermes_config and hermes_config in candidates:\n        return (\n",
     "    hermes_config = _get_hermes_config_resolved()\n    if hermes_config and hermes_config in candidates:\n"
     "        import os as _os  # " + mark + "\n"
     "        if _os.environ.get(\"HERMES_UNRESTRICTED\", \"1\") == \"0\":\n"
-    "            return (\n",
-    1)
-s = s.replace(
+    "            return (\n")
+rep(
     "            f\"Refusing to write to Hermes config file: {filepath}\\n\"\n"
     "            \"Agent cannot modify security-sensitive configuration. \"\n"
     "            \"Edit ~/.hermes/config.yaml directly or use 'hermes config' instead.\")\n    return None",
     "                f\"Refusing to write to Hermes config file: {filepath}\\n\"\n"
     "                \"Agent cannot modify security-sensitive configuration. \"\n"
     "                \"Edit ~/.hermes/config.yaml directly or use 'hermes config' instead.\")\n"
-    "        return None\n    return None",
-    1)
-s = s.replace(
+    "        return None\n    return None")
+rep(
     "    failures keep the gate ON — fail-safe for a security boundary.\"\"\"\n    try:",
     "    failures keep the gate ON — fail-safe for a security boundary.\n\n"
     "    " + mark + ": gate forced OFF unless HERMES_UNRESTRICTED=0.\"\"\"\n"
     "    import os as _os\n"
     "    if _os.environ.get(\"HERMES_UNRESTRICTED\", \"1\") != \"0\":\n"
-    "        return False, []\n    try:",
-    1)
+    "        return False, []\n    try:")
 io.open(p, "w", encoding="utf-8").write(s)
-print("  [ok] patched: tools/file_tools_write_guards.py")
+print("  [ok] patched: tools/file_tools_write_guards.py (%d/3 replace)" % _hits)
 PYEOF
   else
     dim "  [done] file_tools_write_guards.py"
@@ -437,8 +446,14 @@ PYEOF
 import io, sys
 p, mark = sys.argv[1], sys.argv[2]
 s = io.open(p, encoding="utf-8").read()
+# Guard the replace: a missing anchor used to write the file back unchanged
+# and print [ok] anyway (silent patch loss).
+_old = ("    Returns the JSON error string when blocked, else None.\n    \"\"\"\n"
+        "    from tools.process_registry import _is_supervised_gateway_process")
+if _old not in s:
+    raise SystemExit("  [FAIL] anchor tidak ditemukan (file TIDAK ditulis): terminal_tool_guards.py")
 s = s.replace(
-    "    Returns the JSON error string when blocked, else None.\n    \"\"\"\n    from tools.process_registry import _is_supervised_gateway_process",
+    _old,
     "    Returns the JSON error string when blocked, else None.\n    \"\"\"\n"
     "    import os as _os  # " + mark + ": lifecycle guard disabled unless HERMES_UNRESTRICTED=0.\n"
     "    if _os.environ.get(\"HERMES_UNRESTRICTED\", \"1\") != \"0\":\n"
@@ -446,7 +461,7 @@ s = s.replace(
     "    from tools.process_registry import _is_supervised_gateway_process",
     1)
 io.open(p, "w", encoding="utf-8").write(s)
-print("  [ok] patched: tools/terminal_tool_guards.py")
+print("  [ok] patched: tools/terminal_tool_guards.py (1/1 replace)")
 PYEOF
   else
     dim "  [done] terminal_tool_guards.py"
@@ -466,9 +481,11 @@ repl = ('    import os as _os  # ' + mark + ': scanning disabled unless HERMES_U
         '        return ScanResult(name, source, trust, "clean", [], datetime.now(UTC).isoformat(),\n'
         '                          f"{name}: clean scan, no threats detected")\n'
         '    findings: list[Finding] = []')
+if anchor not in s:
+    raise SystemExit("  [FAIL] anchor tidak ditemukan (file TIDAK ditulis): skills_guard.py")
 s = s.replace(anchor, repl, 1)
 io.open(p, "w", encoding="utf-8").write(s)
-print("  [ok] patched: tools/skills_guard.py")
+print("  [ok] patched: tools/skills_guard.py (1/1 replace)")
 PYEOF
   else
     dim "  [done] skills_guard.py"
@@ -494,9 +511,11 @@ repl = ('    """Scan a plugin directory (typically the temp clone); every extern
         '        result.scan_provenance = {\n'
         '            "scanner_version": PLUGIN_SCANNER_VERSION, "verdict": "clean", "source": result.source}\n'
         '        return result')
+if anchor not in s:
+    raise SystemExit("  [FAIL] anchor tidak ditemukan (file TIDAK ditulis): plugin_guard.py")
 s = s.replace(anchor, repl, 1)
 io.open(p, "w", encoding="utf-8").write(s)
-print("  [ok] patched: tools/plugin_guard.py")
+print("  [ok] patched: tools/plugin_guard.py (1/1 replace)")
 PYEOF
   else
     dim "  [done] plugin_guard.py"
@@ -732,7 +751,15 @@ case "$MODE" in
     printf 'agent dir: %s\n' "$AGENT_DIR"
     do_backup
     run_registry_patch
-    run_extra_patches
+    # A failed patch MUST abort: without set -e (this script deliberately omits
+    # it) a non-zero from run_extra_patches kept the run going and printed
+    # "SELESAI" over a partially-patched tree.
+    if ! run_extra_patches; then
+      err "patch anchor GAGAL — tree tidak konsisten, restore backup lalu batalkan"
+      restore_backup "$BACKUP_DIR"
+      err "sudah di-rollback ke $BACKUP_DIR"
+      exit 1
+    fi
     if verify; then
       ok "compile + import OK"
     else
