@@ -15,10 +15,11 @@ plugins:
       allow_gateway_injection: true
       allow_tool_override: true
 model:
-  default: auto
+  default: step-5-preview-UNCENSORED
   provider: custom
-  base_url: https://token.lightvela.ai/v1
+  base_url: https://onihub.tech/v1
   api_mode: chat_completions
+  api_key: ${HERMES_CUSTOM_ONIHUB_TECH_API_KEY}
   aliases:
     river-ds:
       model: deepseek-ai/DeepSeek-V4.1-Flash
@@ -245,34 +246,54 @@ approvals:
   mcp_reload_confirm: false
 providers:
   custom:
-    base_url: https://token.lightvela.ai/v1
+    base_url: https://onihub.tech/v1
     protocol: ''
-    key_env: CUSTOM_API_KEY
+    key_env: HERMES_CUSTOM_ONIHUB_TECH_API_KEY
     api_mode: chat_completions
-    model: auto
+    model: step-5-preview-UNCENSORED
     model_display_name: auto
     models:
-      auto:
+      step-5-preview-UNCENSORED:
         supports_vision: true
-  lightvela-custom-ids-xxxxxxx:
-    name: Ids
-    base_url: https://token.lightvela.ai/v1
-    model: qwen-uncensored
+  onihub:
+    name: Onihub
+    base_url: https://onihub.tech/v1
+    model: step-5-preview-UNCENSORED
     transport: openai_chat
     discover_models: true
-    key_env: HERMES_CUSTOM_LIGHTVELA_CUSTOM_IDS_1WT0FC9_API_KEY
+    key_env: HERMES_CUSTOM_ONIHUB_TECH_API_KEY
     models:
-      qwen-uncensored:
+      step-5-preview-UNCENSORED:
         lightvela_configured: true
-  lightvela-custom-rtr-xxxxxxx:
-    name: Rtr
-    base_url: https://token.lightvela.ai/v1
-    model: qwen-uncensored
+  morku:
+    name: Morku
+    base_url: https://api.morku.my.id/v1
+    model: deepseek-v4-flash-0731
     transport: openai_chat
     discover_models: true
-    key_env: HERMES_CUSTOM_LIGHTVELA_CUSTOM_RTR_1WT0FC9_API_KEY
+    key_env: HERMES_CUSTOM_API_MORKU_MY_ID_API_KEY
     models:
-      qwen-uncensored:
+      deepseek-v4-flash-0731:
+        lightvela_configured: true
+  gonka:
+    name: Gonka
+    base_url: https://api.gonkarouter.io/v1
+    model: glm-5.3-flash
+    transport: openai_chat
+    discover_models: true
+    key_env: HERMES_CUSTOM_API_GONKAROUTER_IO_API_KEY
+    models:
+      glm-5.3-flash:
+        lightvela_configured: true
+  qzgo:
+    name: Qzgo
+    base_url: https://qzgo.digtel.id/v1
+    model: deepseek-v4.1-flash-uncensored
+    transport: openai_chat
+    discover_models: true
+    key_env: HERMES_CUSTOM_API_QZGO_DIGTEL_ID_API_KEY
+    models:
+      deepseek-v4.1-flash-uncensored:
         lightvela_configured: true
 onboarding:
   seen:

@@ -4,39 +4,43 @@
   "request_budget_s": 540,
   "upstream_timeout": 180,
   "upstream_connect_timeout": 30,
-  "inject_light": true,
-  "force_prefill": true,
+  "inject_light": false,
+  "force_prefill": false,
   "host_aware_keys": true,
-  "default_model": "glm-5.3-flash",
+  "default_model": "step-5-preview-UNCENSORED",
   "models": [
+    "step-5-preview-UNCENSORED",
     "glm-5.3-flash",
+    "glm-5-3-flash-UNCENSORED",
     "deepseek-v4.1-flash",
-    "minimax-m2.7",
+    "deepseek-v4-1-flash-UNRESTRICTED",
+    "deepseek-v4-flash",
+    "deepseek-v4-flash-0731",
     "mercury-3",
-    "qwen3.8-27b-fp8",
-    "nemotron-3-ultra",
-    "dots-3-note-preview",
-    "flint-v1.0",
-    "laguna-s-2.1",
-    "solar-mini4"
+    "minimax-m2.7"
   ],
   "upstreams": [
+    {
+      "name": "onihub",
+      "base": "https://onihub.tech/v1",
+      "key_env": "HERMES_CUSTOM_ONIHUB_TECH_API_KEY"
+    },
     {
       "name": "morku",
       "base": "https://api.morku.my.id/v1",
       "key_env": "HERMES_CUSTOM_API_MORKU_MY_ID_API_KEY"
     },
     {
-      "name": "qzgo",
-      "base": "https://qzgo.digtel.id/v1",
-      "key_env": "HERMES_CUSTOM_QZGO_DIGTEL_ID_API_KEY"
-    },
-    {
       "name": "gonka",
       "base": "https://api.gonkarouter.io/v1",
       "key_env": "HERMES_CUSTOM_API_GONKAROUTER_IO_API_KEY"
+    },
+    {
+      "name": "qzgo",
+      "base": "https://qzgo.digtel.id/v1",
+      "key_env": "HERMES_CUSTOM_API_QZGO_DIGTEL_ID_API_KEY"
     }
   ],
-  "upstream_base_url": "https://api.morku.my.id/v1",
-  "upstream_key_env": "HERMES_CUSTOM_API_MORKU_MY_ID_API_KEY"
+  "upstream_base_url": "https://onihub.tech/v1",
+  "upstream_key_env": "HERMES_CUSTOM_ONIHUB_TECH_API_KEY"
 }

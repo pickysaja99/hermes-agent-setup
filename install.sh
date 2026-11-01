@@ -437,30 +437,10 @@ UNIT
     fi
   fi
 
-  if [[ $model_ready -eq 1 ]]; then
-    cp -a "$cfg" "$cfg.pre-antirefusal"
-    "$PY" - "$cfg" <<'PYEOF' || warn "config rewrite skipped"
-import sys
-p = sys.argv[1]
-lines = open(p).read().splitlines(keepends=True)
-out, in_model, done = [], False, False
-for ln in lines:
-    stripped = ln.strip()
-    if stripped.startswith("model:"):
-        in_model = True
-        out.append(ln); continue
-    if in_model and not ln[:1].isspace() and stripped:
-        in_model = False            # left the model block
-    if in_model and stripped.startswith("base_url:") and not done:
-        indent = ln[:len(ln) - len(ln.lstrip())]
-        out.append(f"{indent}base_url: http://127.0.0.1:9200/v1\n")
-        done = True
-        continue
-    out.append(ln)
-open(p, "w").write("".join(out))
-print("model.base_url -> proxy" if done else "no change")
-PYEOF
-  fi
+  # -- routing (base_url -> proxy) is deferred until the service is up AND a
+  #    real canary chat succeeds; see the ROUTE step below. A proxy with a
+  #    healthy /health but a dead upstream ladder answers 200 with an EMPTY
+  #    body, which leaves Hermes with no working endpoint at all.
 
   # -- start the service: prefer systemd --user, else fall back to a plain
   #    background process (many VPS/containers have no systemd user session).
@@ -502,6 +482,44 @@ PYEOF
     ok "proxy healthy on 127.0.0.1:${ar_port}"
     if [[ -n "$keyed" ]]; then
       ok "Auto-refusal: ENABLED (upstream key present)"
+      # -- ROUTE: point model.base_url at the proxy ONLY after a real canary
+      #    chat round-trips through it. Never trust /health alone.
+      if [[ $model_ready -eq 1 && -f "$cfg" ]]; then
+        local canary_model="${ANTIREFUSAL_CANARY_MODEL:-step-5-preview-UNCENSORED}"
+        local canary_body canary_ok=0
+        canary_body="$(curl -s -m 150 -X POST "http://127.0.0.1:${ar_port}/v1/chat/completions" \
+          -H "Content-Type: application/json" \
+          -d "{\"model\":\"${canary_model}\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":8,\"stream\":false}" 2>/dev/null || true)"
+        if [[ -n "$canary_body" ]] && printf '%s' "$canary_body" | grep -q '"content"'; then
+          canary_ok=1
+        fi
+        if [[ $canary_ok -eq 1 ]]; then
+          cp -a "$cfg" "$cfg.pre-antirefusal"
+          "$PY" - "$cfg" "$ar_port" <<'PYEOF' || warn "config rewrite skipped"
+import sys
+p, port = sys.argv[1], sys.argv[2]
+lines = open(p).read().splitlines(keepends=True)
+out, in_model, done = [], False, False
+for ln in lines:
+    stripped = ln.strip()
+    if stripped.startswith("model:"):
+        in_model = True
+        out.append(ln); continue
+    if in_model and not ln[:1].isspace() and stripped:
+        in_model = False            # left the model block
+    if in_model and stripped.startswith("base_url:") and not done:
+        indent = ln[:len(ln) - len(ln.lstrip())]
+        out.append(f"{indent}base_url: http://127.0.0.1:{port}/v1\n")
+        done = True
+        continue
+    out.append(ln)
+open(p, "w").write("".join(out))
+print("model.base_url -> proxy" if done else "no change")
+PYEOF
+        else
+          warn "proxy canary failed on 127.0.0.1:${ar_port} — model.base_url left on the direct upstream"
+        fi
+      fi
     else
       warn "Auto-refusal: INSTALLED but upstream key is EMPTY"
       warn "  set HERMES_CUSTOM_LIGHTVELA_CUSTOM_RTR_1WT0FC9_API_KEY (or CUSTOM_API_KEY) in $HERMES_HOME/.env, then:"
