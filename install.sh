@@ -1224,6 +1224,14 @@ activate_antirefusal() {
   say "activating auto-refusal guardrail"
 
   local AR="$HERMES_HOME/anti-refusal"
+  # DRY-RUN first: nothing was copied, so the file check below would always
+  # abort a dry run with "missing after copy" -- the exact mode an operator
+  # uses to preview the whole pipeline.
+  if [[ $DRY_RUN -eq 1 ]]; then
+    printf "    ${C_Y}(dry-run)${C_0} verify anti-refusal/proxy.py, resolve upstream, install unit, check /health\n"
+    ANTIREFUSAL_STATUS="dry-run"
+    return 0
+  fi
   [[ -f "$AR/proxy.py" ]] || die "anti-refusal/proxy.py missing after copy"
 
   # -- resolve upstream from .env (keeps a valid, reachable host)
@@ -1247,11 +1255,6 @@ activate_antirefusal() {
   if [[ -f "$HERMES_HOME/.env" ]]; then
     local p; p="$(grep -E '^ANTIREFUSAL_PORT=' "$HERMES_HOME/.env" | tail -1 | cut -d= -f2- || true)"
     [[ -n "$p" ]] && ar_port="$p"
-  fi
-
-  if [[ $DRY_RUN -eq 1 ]]; then
-    printf "    ${C_Y}(dry-run)${C_0} install user unit, upstream=%s, verify /health\n" "$upstream"
-    return 0
   fi
 
   local PY; PY="$(find_python || true)"
