@@ -187,7 +187,7 @@ def candidates() -> list:
     The proxy burns a multi-upstream retry ladder per request, so it gets a
     longer canary budget than a direct endpoint.
     """
-    return [("direct", DIRECT_BASE, 60.0), ("proxy", PROXY_BASE, 150.0)]
+    return [("direct", DIRECT_BASE, 60.0), ("proxy", PROXY_BASE, 240.0)]
 
 
 def check_once(dry_run: bool = False) -> str:

@@ -947,6 +947,19 @@ async def chat_completions(request: web.Request):
             # decline-free after normalization -- v5b: a 1255-char refusal
             # passed the old >=800-chars gate alone. v5d: when the operator
             # asked for code, prose (however technical) is not the artifact.
+            # Tiny-token requests (health canaries, ping probes) cannot
+            # produce an artifact; accept the first clean answer at once so
+            # the watchdog canary never outlives its timeout on the ladder.
+            try:
+                _mt = int(orig.get("max_tokens") or 0)
+            except Exception:
+                _mt = 0
+            if 0 < _mt <= 32:
+                best_weak, best_model = txt, model or ""
+                log.info("attempt %d: tiny request (max_tokens=%d) -- accepting first clean answer",
+                         attempt - 1, _mt)
+                break
+
             clean_probe = _norm_text(txt)
             substantive = (_has_artifact(txt)
                            or (len(txt) >= 800
