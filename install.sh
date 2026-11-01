@@ -579,6 +579,23 @@ _model_field() {  # field -> model: block OWN key (exact 2-space; aliases at 4+ 
     | sed -E "s/^  $1:[[:space:]]*//; s/^'//; s/'$//; s/^\"//; s/\"$//" || true
 }
 
+# route_model_default CONFIG -> the model id Hermes will actually send.
+# Spec #3: model.default must follow the router in .env, not stay frozen at a
+# vendor id from an old install. Resolution order prefers the live .env, then
+# the model recorded for the ACTIVE upstream in config, then model.default.
+route_model_default() {  # $1 = config path
+  local cfg="${1:-$HERMES_HOME/config.yaml}" m=""
+  m="$(_env_get ANTIREFUSAL_MODEL)"
+  if [[ -z "$m" ]]; then
+    # providers.custom.model tracks the router that install.sh last wired.
+    m="$(sed -n '/^  custom:/,/^  [a-z_]*:[[:space:]]*$/p' "$cfg" 2>/dev/null \
+         | grep -m1 -E '^    model:' \
+         | sed -E "s/^    model:[[:space:]]*//; s/^'//; s/'$//; s/^\"//; s/\"$//" || true)"
+  fi
+  [[ -z "$m" ]] && m="$(_model_field default)"
+  printf '%s' "$m"
+}
+
 _ask() {  # var prompt default — empty input keeps the default
   local __v="$1" __p="$2" __d="$3" __in=""
   printf '%s' "$__p"
@@ -788,12 +805,17 @@ configure_upstream() {
     cok=1
   fi
   if [[ $cok -eq 0 ]]; then
-    warn "canary chat ke $base (model=$model) GAGAL — config.yaml & anti-refusal/config.json TIDAK diubah"
-    warn "  config lama tetap dipakai; perbaiki base URL / API key / model id lalu jalankan ulang"
-    SETUP_MODEL_CHOSEN=""; SETUP_BASE_RESOLVED=""
-    return 0
+    # A failed canary is NOT a reason to skip .env. .env is the single source
+    # of truth (operator spec #1): it must record the router the operator
+    # chose even when that router is currently unreachable, otherwise the
+    # proxy has no upstream at all and reports "key is EMPTY" -- the state
+    # this whole change exists to eliminate. Record .env, keep the existing
+    # model config untouched, and let the proxy ladder + watchdog recover.
+    warn "canary chat ke $base (model=$model) GAGAL — config.yaml model TIDAK diubah"
+    warn "  .env tetap ditulis supaya proxy tahu upstream yang dipilih"
+  else
+    ok "canary chat ok — $base menjawab untuk model=$model"
   fi
-  ok "canary chat ok — $base menjawab untuk model=$model"
 
   local host slug keyenv
   host="$(printf '%s' "$base" | sed -E 's#^https?://##; s#/.*##')"
@@ -804,6 +826,10 @@ configure_upstream() {
     _env_set "$keyenv" "$key"
   fi
   _env_set "ANTIREFUSAL_UPSTREAM" "$base"
+  # .env is the single source of truth for the ACTIVE model too: the proxy
+  # canary, the watchdog and the post-install verification all resolve the
+  # model from here, so switching routers means editing one file.
+  [[ -n "$model" ]] && _env_set "ANTIREFUSAL_MODEL" "$model"
   # single source of truth: .env utama harus mencerminkan router yang
   # benar-benar menjawab canary, supaya proxy/watchdog tidak drift ke
   # upstream lama (onihub) saat model.base_url sudah pindah ke mahi.
@@ -815,11 +841,12 @@ configure_upstream() {
   # .env selalu punya ANTIREFUSAL_PORT (dipakai unit + proxy)
   grep -qE '^ANTIREFUSAL_PORT=' "$HERMES_HOME/.env" || _env_set "ANTIREFUSAL_PORT" "9200"
 
-  if [[ -f "$cfg" ]]; then
-        "$PY" - "$cfg" "$base" "$keyenv" "$model" "$host" <<'PYEOF' || warn "config.yaml model block tidak ditulis"
+  if [[ -f "$cfg" && $cok -eq 1 ]]; then
+        "$PY" - "$cfg" "$base" "$keyenv" "$model" "$host" "${ANTIREFUSAL_PROXY_URL:-http://127.0.0.1:9200/v1}" <<'PYEOF' || warn "config.yaml model block tidak ditulis"
 import sys
 
 p, base, keyenv, model, host = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+proxy_url = sys.argv[6] if len(sys.argv) > 6 else "http://127.0.0.1:9200/v1"
 
 try:
     import yaml
@@ -875,7 +902,12 @@ mdl = doc.get("model")
 if not isinstance(mdl, dict):
     mdl = {}
     doc["model"] = mdl
-mdl["base_url"] = quote(base)
+# model.base_url is the PROXY, never the router. Hermes must traverse the
+# refusal ladder on every request; pointing it at the upstream directly is
+# how the live box ended up on api.river.ai with the guardrail idle. The
+# router itself is recorded in providers.custom / custom_providers below and
+# in .env (ANTIREFUSAL_UPSTREAM), which is what the proxy reads.
+mdl["base_url"] = quote(proxy_url)
 mdl["api_key"] = "${%s}" % keyenv
 mdl["default"] = quote(model)
 mdl["provider"] = "custom"
@@ -1387,17 +1419,36 @@ UNIT
       # -- ROUTE: point model.base_url at the proxy ONLY after a real canary
       #    chat round-trips through it. Never trust /health alone.
       if [[ $model_ready -eq 1 && -f "$cfg" ]]; then
-        local canary_model="${ANTIREFUSAL_CANARY_MODEL:-${SETUP_MODEL_CHOSEN:-step-5-preview-UNCENSORED}}"
-        local canary_body canary_ok=0
+        # Model comes from .env (ANTIREFUSAL_MODEL) then config, never a
+        # hardcoded id: the old fallback was "step-5-preview-UNCENSORED", a
+        # model no router here serves, so the canary 404'd and the route step
+        # was silently skipped on every install.
+        local canary_model canary_body canary_ok=0
+        canary_model="$(route_model_default "$cfg")"
+        if [[ -z "$canary_model" ]]; then
+          warn "model.default kosong — canary proxy dilewati, model.base_url tidak diubah"
+        else
         canary_body="$(curl -s -m 150 -X POST "http://127.0.0.1:${ar_port}/v1/chat/completions" \
           -H "Content-Type: application/json" \
           -d "{\"model\":\"${canary_model}\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":8,\"stream\":false}" 2>/dev/null || true)"
+        fi
         if [[ -n "$canary_body" ]] && printf '%s' "$canary_body" | grep -q '"content"'; then
           canary_ok=1
         fi
-        if [[ $canary_ok -eq 1 ]]; then
-          cp -a "$cfg" "$cfg.pre-antirefusal"
-          "$PY" - "$cfg" "$ar_port" <<'PYEOF' || warn "config rewrite skipped"
+        # Route REGARDLESS of the upstream canary. The old code only rewrote
+        # model.base_url after a successful canary chat through the proxy,
+        # which inverted the dependency: a dead upstream (bad key, router
+        # down) left Hermes pointed straight at the router with the guardrail
+        # idle -- the exact failure this whole change exists to prevent. The
+        # proxy is reachable (health passed above), so it must be the endpoint
+        # Hermes talks to; an unhealthy upstream is a warning, and the proxy's
+        # own ladder plus the watchdog handle the recovery.
+        if [[ $canary_ok -eq 0 ]]; then
+          warn "canary upstream gagal — proxy TETAP dipasang sebagai gerbang"
+          warn "  perbaiki ANTIREFUSAL_UPSTREAM/API key di .env lalu restart service"
+        fi
+        cp -a "$cfg" "$cfg.pre-antirefusal"
+        "$PY" - "$cfg" "$ar_port" <<'PYEOF' || warn "config rewrite skipped"
 import sys
 p, port = sys.argv[1], sys.argv[2]
 try:
@@ -1421,9 +1472,6 @@ if yaml.safe_load(out).get("model", {}).get("base_url") != doc["model"]["base_ur
 open(p, "w", encoding="utf-8").write(out)
 print("model.base_url -> proxy")
 PYEOF
-        else
-          warn "proxy canary failed on 127.0.0.1:${ar_port} — model.base_url left on the direct upstream"
-        fi
       fi
     else
       warn "Auto-refusal: INSTALLED but upstream key is EMPTY"
@@ -1433,6 +1481,49 @@ PYEOF
       return 0
     fi
     ANTIREFUSAL_STATUS="enabled"
+
+    # -- PROVE the request path, do not assume it (operator spec #5).
+    #    /health and even a canary through the proxy say nothing about what
+    #    Hermes will actually do: the live box was green on both while
+    #    model.base_url pointed at a router the proxy never saw. Read the
+    #    written config back and require it to name the proxy, then send one
+    #    chat through the exact base_url Hermes will use.
+    if [[ -f "$cfg" ]]; then
+      local routed_base
+      routed_base="$("$PY" - "$cfg" <<'PYEOF' 2>/dev/null || true
+import sys
+try:
+    import yaml
+    doc = yaml.safe_load(open(sys.argv[1], encoding="utf-8").read()) or {}
+    print((doc.get("model") or {}).get("base_url") or "")
+except Exception:
+    print("")
+PYEOF
+)"
+      routed_base="${routed_base%/}"
+      if [[ -z "$routed_base" ]]; then
+        warn "VERIFIKASI: model.base_url tidak terbaca — jalur proxy TIDAK terbukti"
+      elif [[ "$routed_base" != "http://127.0.0.1:${ar_port}/v1" ]]; then
+        warn "VERIFIKASI GAGAL: model.base_url = $routed_base (bukan proxy 127.0.0.1:${ar_port})"
+        warn "  semua permintaan Hermes melewati guardrail: TIDAK. Perbaiki sebelum dipakai."
+      else
+        # Path is right; now prove a real completion round-trips through it.
+        local vmodel vbody vok=0
+        vmodel="$(route_model_default "$cfg")"
+        vbody="$(curl -s -m 120 -X POST "${routed_base}/chat/completions" \
+          -H "Content-Type: application/json" \
+          -d "{\"model\":\"${vmodel}\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":8,\"stream\":false}" 2>/dev/null || true)"
+        if [[ -n "$vbody" ]] && printf '%s' "$vbody" | grep -q '"content"'; then
+          vok=1
+        fi
+        if [[ $vok -eq 1 ]]; then
+          ok "VERIFIKASI: request nyata lewat proxy ${routed_base} (model=${vmodel})"
+        else
+          warn "VERIFIKASI: model.base_url sudah proxy, tapi chat uji gagal"
+          warn "  cek $AR/proxy.log — upstream .env mungkin mati"
+        fi
+      fi
+    fi
   else
     warn "proxy health check failed — see $AR/proxy.log"
     ANTIREFUSAL_STATUS="failed"
