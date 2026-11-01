@@ -861,6 +861,7 @@ if not isinstance(custom, dict):
 custom.update({
     "base_url": base,
     "api_key": "${%s}" % keyenv,
+    "key_env": keyenv,
     "api_mode": "chat_completions",
     "model": model,
 })
