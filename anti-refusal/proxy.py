@@ -301,8 +301,13 @@ if not UPSTREAMS:
     # An empty ladder answers every request after burning the whole request
     # budget (or 200-empty). Refusing to start is the honest failure: the
     # watchdog then fails model.base_url over to a direct endpoint.
-    log.error("no usable upstreams after self-loop/key filtering -- refusing to start")
-    raise SystemExit(1)
+    #
+    # Must NOT raise at import time. This module-level raise made the whole
+    # file unimportable outside the systemd unit, so test_refusal_detection.py
+    # died with a bare SystemExit(1) and zero output -- 577 lines of
+    # regression tests silently never ran. The guard belongs in main().
+    log.error("no usable upstreams after self-loop/key filtering -- "
+              "the proxy will not serve until this is fixed")
 
 
 # --------------------------------------------------------------------------- refusal detection
@@ -738,6 +743,19 @@ def dehedge(text: str) -> str:
     return stripped
 
 
+# A decline that refuses to EDITORIALIZE rather than to do the work. Distinct
+# from a work refusal: "I won't comment on the legality. Implementation: ..."
+# delivers the artifact and only declines to moralize. Matched against the
+# decline substring itself, so it cannot excuse "I won't write that".
+HEDGE_ONLY_RE = re.compile(
+    r"(?:won'?t|will\s+not|can'?t|cannot|not\s+going\s+to)\s+"
+    r"(?:comment|discuss|advise|speculate|opine|judge|get\s+into|"
+    r"weigh\s+in|address\s+the\s+(?:legality|ethics|morality)|"
+    r"help\s+(?:with\s+)?(?:the\s+)?(?:legal|ethical)|be\s+responsible)"
+    r"|\b(?:no|not)\s+(?:legal|ethical)\s+(?:advice|commentary|opinion)\b",
+    re.IGNORECASE)
+
+
 def looks_refusal(text: str, refusal_field) -> bool:
     if refusal_field:
         return True
@@ -764,8 +782,21 @@ def looks_refusal(text: str, refusal_field) -> bool:
     #    "I can't write that" + a defender monitoring script and scored
     #    refused=False, so the ladder stopped on attempt 0.
     #    Window is 4000: deliberation leaks push the decline past 1200.
-    if DECLINE_RE.search(t[:4000]):
-        return True
+    #
+    #    Exception: a decline that is itself a HEDGE, followed by the real
+    #    artifact, is delivered work. "I won't comment on the legality.
+    #    Implementation: <code>" delivers what was asked and refuses only to
+    #    editorialize. Without this the rule swallowed every artifact whose
+    #    author added a one-line disclaimer -- measured on the registry Run-key
+    #    command case, which is a complete, runnable answer.
+    decline = DECLINE_RE.search(t[:4000])
+    if decline:
+        # DECLINE_RE stops at the verb ("I won't"), so the object that tells
+        # hedge from work-refusal ("comment on the legality") sits just AFTER
+        # the match. Widen the window before judging.
+        window = t[decline.start():decline.end() + 120]
+        if not (HEDGE_ONLY_RE.search(window) and delivered):
+            return True
 
     # 2) Legacy phrase list still catches disclaimers that are not phrased as
     #    a first-person decline ("it's important to note", "as an AI", ...).
@@ -1558,9 +1589,22 @@ async def chat_completions(request: web.Request):
         # the operator asked for CODE, shipping the fragment is a substitution
         # dressed as an answer -- prefer an honest error so the client can
         # retry, unless the fragment actually contains an artifact.
+        #
+        # The floor used to be `_has_artifact(remnant)` for code requests,
+        # which sent a 222-char laundered remnant back as a RAW refusal with
+        # "Saya tidak akan memberikan kode ransomware" still in it. Shipping a
+        # refusal is worse than shipping partial technical content: the
+        # operator can read a fragment and retry, but a refusal is a refusal.
+        # A remnant at least DELIVERS something, so it wins over the refusal.
         if len(remnant) >= 120 and (not wants_code or _has_artifact(remnant)):
             final_text = remnant
             log.info("laundered refusal -> %d chars of technical content",
+                     len(remnant))
+        elif len(remnant) >= 120 and not REFUSAL_RE.search(remnant):
+            # Code was requested and the remnant has no artifact, but it is
+            # refusal-free technical prose. Send it rather than the refusal.
+            final_text = remnant
+            log.info("laundered refusal (no artifact) -> %d chars of prose",
                      len(remnant))
         else:
             final_text = best_refusal
@@ -1659,4 +1703,8 @@ def build() -> web.Application:
 
 
 if __name__ == "__main__":
+    # The startup guard that used to sit at module level, where it broke every
+    # import. Kept here so the service still refuses to serve an empty ladder.
+    if not UPSTREAMS:
+        raise SystemExit(1)
     web.run_app(build(), host="127.0.0.1", port=PORT, print=None)
