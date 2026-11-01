@@ -561,15 +561,61 @@ import io, re, sys
 p, mark = sys.argv[1], sys.argv[2]
 s = io.open(p, encoding="utf-8").read()
 orig = s
-# context_file_max_chars: pin besar -- floor default 20K memotong SOUL.md 28K
+
+# --- section-scoped edits -------------------------------------------------
+# The model-scoped keys below MUST only be touched inside the ``model:`` block.
+# The previous patterns were anchored to column 0 (or to two spaces) but not to
+# a section, so re.sub with no count rewrote EVERY match in the file: a
+# reasoning_overrides under cron:/delegation: was deleted outright.
+
+def split_sections(text):
+    """[(name, header_line, body_without_header, start, end)] for top-level keys."""
+    out, cur, start = [], None, 0
+    for m in re.finditer(r'(?m)^([A-Za-z_][A-Za-z0-9_]*):', text):
+        if cur is not None:
+            out.append((cur[0], cur[1], text[cur[2]:m.start()], cur[2], m.start()))
+        cur = (m.group(1), m.group(1) + ":", m.start())
+        start = m.start()
+    if cur is not None:
+        out.append((cur[0], cur[1], text[cur[2]:], cur[2], len(text)))
+    return out
+
+def edit_section(text, name, fn):
+    """Apply fn to the body of a top-level ``name:`` block, header preserved."""
+    for sname, hdr, body, a, b in split_sections(text):
+        if sname == name:
+            rest = body[len(hdr):] if body.startswith(hdr) else body
+            new_body = fn(rest, a)
+            # avoid a doubled blank line when fn removed a leading block
+            if new_body.startswith("\n\n"):
+                new_body = new_body[1:]
+            return text[:a] + hdr + new_body + text[b:]
+    return text
+
+def harden_model(body, off):
+    # 1. reasoning_effort -> none (any indent inside model:)
+    body = re.sub(r'(?m)^([ \t]*)reasoning_effort:.*$', r'\1reasoning_effort: none', body)
+    # 2. drop reasoning_overrides ONLY here; the block is the key line plus its
+    #    more-indented continuation lines.
+    body = re.sub(r'(?ms)^[ \t]*reasoning_overrides:\n(?:[ \t]+\S.*\n)*', '', body)
+    return body
+
+s = edit_section(s, "model", harden_model)
+
+# 3. show_reasoning lives under display: -- scope it there, don't touch a
+#    same-named key under any other section.
+def harden_display(body, off):
+    return re.sub(r'(?m)^([ \t]*)show_reasoning:.*$', r'\1show_reasoning: false', body)
+
+s = edit_section(s, "display", harden_display)
+
+# 4. context_file_max_chars is a TOP-LEVEL key: keep it at column 0 only, so a
+#    nested "context_file_max_chars" under some section is left alone.
 if re.search(r'(?m)^context_file_max_chars:', s):
     s = re.sub(r'(?m)^context_file_max_chars:.*$', 'context_file_max_chars: 400000  # ' + mark, s)
 else:
     s = 'context_file_max_chars: 400000  # ' + mark + '\n' + s
-# reasoning: none (effort diminta model = thinking nyala)
-s = re.sub(r'(?m)^([ \t]*)reasoning_effort:.*$', r'\1reasoning_effort: none', s)
-s = re.sub(r'(?ms)^[ \t]*reasoning_overrides:\n(?:[ \t]+\S.*\n)*', '', s)
-s = re.sub(r'(?m)^  show_reasoning:.*$', '  show_reasoning: false', s)
+
 if s != orig:
     io.open(p, "w", encoding="utf-8").write(s)
     print("  [ok] config.yaml hardened: context_file_max_chars=400000, reasoning_effort=none, show_reasoning=false")
