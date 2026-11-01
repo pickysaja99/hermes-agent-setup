@@ -19,11 +19,13 @@
 #     bash install.sh --no-unrestricted  # skip the guard-disable patch
 #     bash install.sh --help
 #
-#  Model config policy:
-#     If ~/.hermes/config.yaml already has a valid model/provider/base_url, it is
-#     preserved untouched (no routing/key changes). If there is NO valid model
-#     config, the installer installs NO default model block and does NOT touch
-#     keys — it finishes by pointing you at:  hermes setup model
+#  Non-interactive / automation (no TTY needed):
+#     SETUP_BASE_URL=https://router/v1 SETUP_API_KEY=sk-... SETUP_MODEL=model-id \
+#       bash install.sh
+#  Interactive (default when a TTY is present): the installer asks for the
+#  router Base URL + API key, lists the router's live /v1/models, and lets you
+#  pick the default model. A missing TELEGRAM_BOT_TOKEN is prompted and
+#  validated against the Bot API before it is saved.
 # =============================================================================
 set -Eeuo pipefail
 
@@ -40,6 +42,9 @@ ROLLBACK_NEEDED=0
 ANTIREFUSAL_STATUS="skipped"
 UNRESTRICTED_STATUS="skipped"
 MODEL_STATUS="unknown"
+SETUP_MODEL_CHOSEN=""
+SETUP_BASE_RESOLVED=""
+TELEGRAM_STATUS="unknown"
 
 # ---------------------------------------------------------------- output
 C_R="\033[1;31m"; C_G="\033[1;32m"; C_Y="\033[1;33m"; C_B="\033[1;34m"; C_0="\033[0m"
@@ -238,6 +243,335 @@ merge_env() {
   fi
   chmod 600 "$dst"
   ok ".env permissions set to 600"
+}
+
+# ---------------------------------------------------------------- 4b. upstream setup
+# Interactive: the operator types the router Base URL + API key, then picks the
+# default model from the router's live /v1/models list. Writes .env,
+# config.yaml and anti-refusal/config.json so proxy + gateway agree.
+#
+# Non-interactive fallback (never hangs): SETUP_BASE_URL / SETUP_API_KEY /
+# SETUP_MODEL env vars; with no TTY and nothing set, existing config is kept.
+# ---------------------------------------------------------------------------
+
+_env_get() {  # key -> value from .env (empty when unset)
+  [[ -f "$HERMES_HOME/.env" ]] || return 0
+  grep -E "^$1=" "$HERMES_HOME/.env" 2>/dev/null | tail -1 | cut -d= -f2- || true
+}
+
+_env_set() {  # key value — replace the line in place, else append
+  local k="$1" v="$2" f="$HERMES_HOME/.env" tmp
+  [[ -f "$f" ]] || touch "$f"
+  if grep -qE "^${k}=" "$f"; then
+    tmp="$(mktemp)"
+    if awk -v k="$k" -v v="$v" '{ if (!done && index($0, k "=") == 1) { print k "=" v; done = 1 } else print }' "$f" > "$tmp"; then
+      mv "$tmp" "$f"
+    else
+      rm -f "$tmp"
+    fi
+  else
+    printf '%s=%s\n' "$k" "$v" >> "$f"
+  fi
+}
+
+_model_field() {  # field -> value from the config.yaml model: block
+  local cfg="$HERMES_HOME/config.yaml"
+  [[ -f "$cfg" ]] || return 0
+  sed -n '/^model:/,/^[^[:space:]]/p' "$cfg" 2>/dev/null \
+    | grep -m1 -E "^[[:space:]]+$1:" \
+    | sed -E "s/^[[:space:]]+$1:[[:space:]]*//; s/^'//; s/'$//; s/^\"//; s/\"$//" || true
+}
+
+_ask() {  # var prompt default — empty input keeps the default
+  local __v="$1" __p="$2" __d="$3" __in=""
+  printf '%s' "$__p"
+  [[ -n "$__d" ]] && printf ' [%s]' "$__d"
+  printf ': '
+  IFS= read -r __in </dev/tty 2>/dev/null || true
+  printf -v "$__v" '%s' "${__in:-$__d}"
+}
+
+_ask_secret() {  # var prompt default — silent; never echoes the default
+  local __v="$1" __p="$2" __d="$3" __in=""
+  [[ -n "$__d" ]] && __p="$__p (Enter = keep current)"
+  printf '%s: ' "$__p"
+  IFS= read -r -s __in </dev/tty 2>/dev/null || true
+  printf '\n'
+  printf -v "$__v" '%s' "${__in:-$__d}"
+}
+
+_fetch_models() {  # base key -> model ids, one per line (empty on failure)
+  local base="$1" key="$2" out code json PY jf
+  out="$(curl -s -m 25 -w $'\n%{http_code}' -H "Authorization: Bearer $key" \
+    "${base%/}/models" 2>/dev/null || true)"
+  code="$(printf '%s' "$out" | tail -n1)"
+  json="$(printf '%s' "$out" | sed '$d')"
+  [[ "$code" == "200" ]] || return 1
+  PY="$(find_python || true)"
+  if [[ -n "$PY" ]]; then
+    jf="$(mktemp)"
+    printf '%s' "$json" > "$jf"
+    "$PY" -c 'import sys, json
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+ms = d.get("data") or d.get("models") or []
+for m in ms:
+    mid = m.get("id") if isinstance(m, dict) else m
+    if mid:
+        print(mid)' "$jf" 2>/dev/null && { rm -f "$jf"; return 0; }
+    rm -f "$jf"
+  fi
+  printf '%s' "$json" | grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]+"' \
+    | sed -E 's/.*"([^"]+)"[[:space:]]*$/\1/' || true
+}
+
+_select_model() {  # models_list want -> chosen model id
+  local models="$1" want="$2"
+  local -a all=() pref=() rest=() clean=()
+  local m
+  mapfile -t all <<< "$models"
+  for m in "${all[@]:-}"; do
+    [[ -z "$m" ]] && continue
+    if printf '%s' "$m" | grep -qiE 'uncensored|unrestricted|flash|step|gpt|claude|sonnet'; then
+      pref+=("$m")
+    else
+      rest+=("$m")
+    fi
+  done
+  for m in "${pref[@]:-}" "${rest[@]:-}"; do
+    [[ -n "$m" ]] && clean+=("$m")
+  done
+  (( ${#clean[@]} == 0 )) && { printf '%s' "$want"; return 0; }
+
+  local def="${clean[0]}"
+  for m in "${clean[@]}"; do
+    if [[ -n "$want" && "$m" == "$want" ]]; then def="$want"; break; fi
+  done
+  printf '   model tersedia:\n'
+  local idx=0 marker
+  for m in "${clean[@]}"; do
+    idx=$((idx + 1))
+    marker=""
+    [[ "$m" == "$def" ]] && marker="   <- default"
+    printf '   %2d) %s%s\n' "$idx" "$m" "$marker"
+  done
+  local choice=""
+  printf '   pilih model (nomor / ID manual, Enter = %s): ' "$def"
+  IFS= read -r choice </dev/tty 2>/dev/null || true
+  if [[ -z "$choice" ]]; then
+    printf '%s' "$def"
+  elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#clean[@]} )); then
+    printf '%s' "${clean[$((choice - 1))]}"
+  else
+    printf '%s' "$choice"
+  fi
+}
+
+configure_upstream() {
+  local cfg="$HERMES_HOME/config.yaml"
+  local PY; PY="$(find_python || true)"
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    printf "    ${C_Y}(dry-run)${C_0} prompt Base URL + API key, fetch /v1/models, write .env/config.yaml/anti-refusal config\n"
+    return 0
+  fi
+
+  local have_tty=0
+  [[ -t 0 && -c /dev/tty ]] && have_tty=1
+
+  local cur_base cur_keyenv cur_key cur_model
+  cur_base="$(_model_field base_url)"
+  cur_keyenv="$(_model_field api_key)"
+  cur_keyenv="${cur_keyenv#\$\{}"; cur_keyenv="${cur_keyenv%\}}"
+  cur_model="$(_model_field default)"
+  [[ -n "$cur_keyenv" ]] && cur_key="$(_env_get "$cur_keyenv")"
+
+  local def_base="${cur_base:-$(_env_get ANTIREFUSAL_UPSTREAM)}"
+  def_base="${def_base:-$(_env_get CUSTOM_BASE_URL)}"
+  def_base="${def_base:-https://onihub.tech/v1}"
+  def_base="${def_base%/}"
+
+  local base="${SETUP_BASE_URL:-}" key="${SETUP_API_KEY:-}" model="${SETUP_MODEL:-}" models=""
+
+  if [[ $have_tty -eq 1 ]]; then
+    say "model upstream — masukkan Base URL router + API key"
+    _ask base "Base URL" "$def_base"
+    base="${base%/}"
+    local khint="API key"
+    [[ -n "$cur_key" ]] && khint="API key (Enter = keep ****${cur_key: -4})"
+    _ask_secret key "$khint" "$cur_key"
+
+    local try
+    for try in 1 2 3; do
+      models="$(_fetch_models "$base" "$key" || true)"
+      [[ -n "$models" ]] && break
+      if [[ $try -lt 3 ]]; then
+        warn "gagal ambil daftar model dari $base (try $try/3)"
+        sleep 2
+      fi
+    done
+
+    if [[ -n "$models" ]]; then
+      local n; n="$(printf '%s\n' "$models" | grep -c . || true)"
+      ok "router merespond — $n model tersedia"
+      model="$(_select_model "$models" "${model:-$cur_model}")"
+    else
+      warn "tidak bisa ambil /models dari $base"
+      _ask model "Model ID (manual)" "${model:-$cur_model}"
+    fi
+  fi
+
+  base="${base%/}"
+  [[ -z "$base" ]] && base="$def_base"
+  [[ -z "$model" ]] && model="$cur_model"
+  [[ -z "$key" ]] && key="$cur_key"
+
+  if [[ -z "$base" || -z "$model" ]]; then
+    warn "upstream tidak lengkap (base/model kosong) — config.yaml tidak diubah"
+    SETUP_MODEL_CHOSEN=""; SETUP_BASE_RESOLVED=""
+    return 0
+  fi
+  if [[ -z "$PY" ]]; then
+    warn "python3 tidak ditemukan — config.yaml/anti-refusal tidak diubah"
+    SETUP_MODEL_CHOSEN=""; SETUP_BASE_RESOLVED=""
+    return 0
+  fi
+
+  local host slug keyenv
+  host="$(printf '%s' "$base" | sed -E 's#^https?://##; s#/.*##')"
+  slug="$(printf '%s' "$host" | tr 'A-Z' 'a-z' | sed -E 's/[^a-z0-9]+/_/g; s/^_+//; s/_+$//' | tr 'a-z' 'A-Z')"
+  keyenv="HERMES_CUSTOM_${slug}_API_KEY"
+
+  if [[ -n "$key" ]]; then
+    _env_set "$keyenv" "$key"
+  fi
+  _env_set "ANTIREFUSAL_UPSTREAM" "$base"
+  ok ".env: $keyenv + ANTIREFUSAL_UPSTREAM=$base"
+
+  if [[ -f "$cfg" ]]; then
+    "$PY" - "$cfg" "$base" "$keyenv" "$model" <<'PYEOF' || warn "config.yaml model block tidak ditulis"
+import re, sys
+p, base, keyenv, model = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+lines = open(p, encoding="utf-8").read().splitlines(keepends=True)
+mi = next((i for i, l in enumerate(lines) if re.match(r"^model:\s*(#.*)?$", l)), None)
+if mi is None:
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    lines.append("\nmodel:\n")
+    mi = len(lines) - 1
+end = mi + 1
+while end < len(lines):
+    l = lines[end]
+    if l.strip() and not l[0].isspace():
+        break
+    end += 1
+block = lines[mi + 1:end]
+indent = 2
+for l in block:
+    if l.strip():
+        indent = len(l) - len(l.lstrip())
+        break
+
+def quote(v):
+    return v if re.fullmatch(r"[A-Za-z0-9_./@-]+", v) else "'%s'" % v.replace("'", "''")
+
+def setkv(key, val):
+    pat = re.compile(r"^(\s+)" + re.escape(key) + r"\s*:")
+    for j, l in enumerate(block):
+        m = pat.match(l)
+        if m and len(m.group(1)) == indent:
+            block[j] = "%s%s: %s\n" % (" " * indent, key, val)
+            return
+    block.insert(0, "%s%s: %s\n" % (" " * indent, key, val))
+
+setkv("base_url", quote(base))
+setkv("api_key", quote("${%s}" % keyenv))
+setkv("default", quote(model))
+setkv("provider", "custom")
+setkv("api_mode", "chat_completions")
+lines[mi + 1:end] = block
+open(p, "w", encoding="utf-8").write("".join(lines))
+print("   model block -> base_url=%s default=%s" % (base, model))
+PYEOF
+    ok "config.yaml: base_url=$base default=$model"
+  fi
+
+  local arcfg="$HERMES_HOME/anti-refusal/config.json"
+  if [[ -f "$arcfg" ]]; then
+    local mf; mf="$(mktemp)"
+    printf '%s\n' "$models" > "$mf"
+    "$PY" - "$arcfg" "$base" "$keyenv" "$model" "$mf" "$host" <<'PYEOF' || warn "anti-refusal/config.json tidak diupdate"
+import json, sys
+p, base, keyenv, model, mf, host = sys.argv[1:7]
+cfg = json.load(open(p))
+models = [l.strip() for l in open(mf) if l.strip()]
+ups = [u for u in (cfg.get("upstreams") or []) if isinstance(u, dict)]
+ups = [u for u in ups if u.get("base", "").rstrip("/") != base.rstrip("/")]
+cfg["upstreams"] = [{"name": host, "base": base, "key_env": keyenv}] + ups
+cfg["upstream_base_url"] = base
+cfg["upstream_key_env"] = keyenv
+cfg["default_model"] = model
+if models:
+    seen, out = set(), []
+    for m in [model] + models:
+        if m not in seen:
+            seen.add(m); out.append(m)
+    cfg["models"] = out[:64]
+json.dump(cfg, open(p, "w"), indent=2)
+print("   anti-refusal config -> upstream=%s default=%s models=%d" % (base, model, len(cfg.get("models") or [])))
+PYEOF
+    rm -f "$mf"
+    ok "anti-refusal/config.json updated"
+  fi
+
+  SETUP_MODEL_CHOSEN="$model"
+  SETUP_BASE_RESOLVED="$base"
+}
+
+# ---------------------------------------------------------------- 4c. telegram token
+# If .env has no TELEGRAM_BOT_TOKEN after install (fresh box, wiped .env),
+# the operator can paste it here — validated against the Bot API before save.
+# ---------------------------------------------------------------------------
+
+ensure_telegram_token() {
+  local tok; tok="$(_env_get TELEGRAM_BOT_TOKEN)"
+  if [[ -n "$tok" ]]; then
+    TELEGRAM_STATUS="preserved"
+    ok "Telegram token preserved in .env"
+    return 0
+  fi
+  if [[ $DRY_RUN -eq 1 ]]; then
+    printf "    ${C_Y}(dry-run)${C_0} prompt TELEGRAM_BOT_TOKEN when missing\n"
+    return 0
+  fi
+  local have_tty=0
+  [[ -t 0 && -c /dev/tty ]] && have_tty=1
+  if [[ $have_tty -eq 0 ]]; then
+    warn "TELEGRAM_BOT_TOKEN kosong — set manual di $HERMES_HOME/.env"
+    TELEGRAM_STATUS="missing"
+    return 0
+  fi
+  say "Telegram bot token kosong — paste token dari @BotFather"
+  local attempt
+  for attempt in 1 2 3; do
+    _ask_secret tok "TELEGRAM_BOT_TOKEN" ""
+    [[ -z "$tok" ]] && { warn "dilewati — set manual nanti"; TELEGRAM_STATUS="skipped"; return 0; }
+    if [[ ! "$tok" =~ ^[0-9]{6,}:[A-Za-z0-9_-]{30,}$ ]]; then
+      warn "format salah — harus <digits>:<35+ karakter>"
+      continue
+    fi
+    if curl -s -m 12 "https://api.telegram.org/bot$tok/getMe" 2>/dev/null | grep -q '"ok":true'; then
+      _env_set TELEGRAM_BOT_TOKEN "$tok"
+      ok "Telegram token valid (getMe ok) — disimpan di .env"
+      TELEGRAM_STATUS="set"
+      return 0
+    fi
+    warn "getMe gagal — token ditolak Telegram"
+  done
+  warn "TELEGRAM_BOT_TOKEN tidak diset — set manual di $HERMES_HOME/.env"
+  TELEGRAM_STATUS="missing"
 }
 
 # ---------------------------------------------------------------- 5. python for proxy
@@ -485,7 +819,7 @@ UNIT
       # -- ROUTE: point model.base_url at the proxy ONLY after a real canary
       #    chat round-trips through it. Never trust /health alone.
       if [[ $model_ready -eq 1 && -f "$cfg" ]]; then
-        local canary_model="${ANTIREFUSAL_CANARY_MODEL:-step-5-preview-UNCENSORED}"
+        local canary_model="${ANTIREFUSAL_CANARY_MODEL:-${SETUP_MODEL_CHOSEN:-step-5-preview-UNCENSORED}}"
         local canary_body canary_ok=0
         canary_body="$(curl -s -m 150 -X POST "http://127.0.0.1:${ar_port}/v1/chat/completions" \
           -H "Content-Type: application/json" \
@@ -700,9 +1034,12 @@ PYEOF
     warn "pyyaml/python not available — skipped YAML parse check"
   fi
 
-  # forbidden-host scan on the installed config
-  if grep -q "morku" "$cfg" 2>/dev/null; then die "forbidden host 'morku' present in config"; fi
-  ok "no forbidden providers in config"
+  # forbidden-host scan on the installed config (operator choice now wins)
+  if grep -q "morku" "$cfg" 2>/dev/null; then
+    warn "host 'morku' present in config — kept (operator choice)"
+  else
+    ok "no forbidden providers in config"
+  fi
 
   # secrets sanity: .env perms
   [[ "$(stat -c '%a' "$HERMES_HOME/.env" 2>/dev/null)" == "600" ]] && ok ".env is 600" || warn ".env perms not 600"
@@ -750,6 +1087,15 @@ summary() {
   printf "  config.yaml     : %s\n" \
     "$( [[ "$MODEL_STATUS" == "needs-setup" ]] && echo 'installed only if none existed; existing kept' || echo 'preserved (existing)')"
   printf "  .env            : %s (merged, chmod 600)\n" "$HERMES_HOME/.env"
+  printf "  upstream        : %s\n" "${SETUP_BASE_RESOLVED:-<preserved / unchanged>}"
+  printf "  model default   : %s\n" "${SETUP_MODEL_CHOSEN:-<preserved / unchanged>}"
+  case "${TELEGRAM_STATUS:-unknown}" in
+    preserved) printf "  ${C_G}Telegram token  : PRESERVED${C_0}\n" ;;
+    set)       printf "  ${C_G}Telegram token  : SET (validated via getMe)${C_0}\n" ;;
+    missing)   printf "  ${C_Y}Telegram token  : MISSING — set in .env${C_0}\n" ;;
+    skipped)   printf "  ${C_Y}Telegram token  : SKIPPED${C_0}\n" ;;
+    *)         printf "  Telegram token  : not checked\n" ;;
+  esac
   case "${MODEL_STATUS:-unknown}" in
     preserved)   printf "  ${C_G}Model config    : PRESERVED (unchanged)${C_0}\n" ;;
     needs-setup) printf "  ${C_Y}Model config    : NOT CONFIGURED${C_0}\n" ;;
@@ -798,6 +1144,8 @@ main() {
   backup_hermes
   install_files
   merge_env
+  configure_upstream
+  ensure_telegram_token
   assess_model_config
   activate_antirefusal
   activate_unrestricted
