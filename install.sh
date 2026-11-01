@@ -15,6 +15,12 @@
 #     bash install.sh --dry-run        # show what would happen, change nothing
 #     bash install.sh --no-antirefusal # skip the auto-refusal activation stage
 #     bash install.sh --help
+#
+#  Model config policy:
+#     If ~/.hermes/config.yaml already has a valid model/provider/base_url, it is
+#     preserved untouched (no routing/key changes). If there is NO valid model
+#     config, the installer installs NO default model block and does NOT touch
+#     keys — it finishes by pointing you at:  hermes setup model
 # =============================================================================
 set -Eeuo pipefail
 
@@ -27,6 +33,8 @@ DO_ANTIREFUSAL=1
 BACKUP_DIR=""
 STAGE_LOG=""
 ROLLBACK_NEEDED=0
+ANTIREFUSAL_STATUS="skipped"
+MODEL_STATUS="unknown"
 
 # ---------------------------------------------------------------- output
 C_R="\033[1;31m"; C_G="\033[1;32m"; C_Y="\033[1;33m"; C_B="\033[1;34m"; C_0="\033[0m"
@@ -153,13 +161,21 @@ install_files() {
   local S="$WORKDIR/repo"
   say "installing setup files"
   run cp "$S/SOUL.md"    "$HERMES_HOME/SOUL.md"
-  run cp "$S/config.yaml" "$HERMES_HOME/config.yaml"
   run cp "$S/profile.yaml" "$HERMES_HOME/profile.yaml"
   run cp -r "$S/skills"   "$HERMES_HOME/"
   run cp -r "$S/memories" "$HERMES_HOME/"
   run cp -r "$S/plugins"  "$HERMES_HOME/"
   run cp -r "$S/anti-refusal" "$HERMES_HOME/"
   run cp "$S/README.md"   "$HERMES_HOME/SETUP-README.md"
+
+  # config.yaml: only install the shipped template if the target has NO config
+  # yet. If a config exists, keep it (its model/provider/API-key must survive).
+  if [[ ! -f "$HERMES_HOME/config.yaml" ]]; then
+    run cp "$S/config.yaml" "$HERMES_HOME/config.yaml"
+    ok "config.yaml installed (none existed)"
+  else
+    ok "existing config.yaml preserved (not overwritten)"
+  fi
   ok "files copied"
 }
 
@@ -214,6 +230,97 @@ find_python() {
     [[ -n "$c" && -x "$c" ]] && { echo "$c"; return 0; }
   done
   return 1
+}
+
+# ---------------------------------------------------------------- model config check
+# Returns 0 only if the config already has a usable model/provider/API-key setup.
+# "Usable" = has a model.default (non-empty), a model.provider, a non-empty
+# model.base_url that is NOT an unresolved placeholder, and either an api_key or
+# a provider block that supplies one. If not, the installer must NOT install a
+# default model config or touch keys — it points the user at `hermes setup`.
+model_config_ok() {
+  local cfg="${1:-$HERMES_HOME/config.yaml}"
+  [[ -f "$cfg" ]] || return 1
+  local PY; PY="$(find_python || true)"
+
+  # Preferred: precise parse via pyyaml
+  if [[ -n "$PY" ]] && "$PY" -c "import yaml" 2>/dev/null; then
+    "$PY" - "$cfg" <<'PYEOF'
+import sys
+import yaml
+p = sys.argv[1]
+try:
+    cfg = yaml.safe_load(open(p)) or {}
+except Exception:
+    sys.exit(1)
+m = cfg.get("model") or {}
+base = str(m.get("base_url") or "").strip()
+prov = str(m.get("provider") or "").strip()
+default = str(m.get("default") or "").strip()
+bad_base = (not base) or ("<" in base) or ("LLM_ROUTER_HOST" in base) or ("placeholder" in base.lower())
+providers = cfg.get("providers") or {}
+prov_ok = False
+for name, blk in providers.items():
+    if not isinstance(blk, dict):
+        continue
+    pb = str(blk.get("base_url") or "").strip()
+    if pb and "<" not in pb and "LLM_ROUTER_HOST" not in pb and blk.get("key_env"):
+        prov_ok = True
+        break
+ok = bool(default) and bool(prov) and (not bad_base or prov_ok)
+sys.exit(0 if ok else 1)
+PYEOF
+    return $?
+  fi
+
+  # Fallback: pyyaml not available -> minimal indentation-aware scan (no regex
+  # backtracking). We only need to know: is there a non-empty model.default,
+  # a provider, and a base_url that is not an unresolved placeholder?
+  local in_model=0 have_default=0 have_provider=0 have_base=0 base_bad=0
+  while IFS= read -r line; do
+    [[ -z "${line// }" ]] && continue
+    if [[ "$line" =~ ^[^[:space:]] ]]; then
+      in_model=0
+      [[ "$line" =~ ^model: ]] && in_model=1
+      continue
+    fi
+    [[ $in_model -eq 1 ]] || continue
+    case "$line" in
+      *"default:"*) [[ -n "${line#*default:}" && "${line#*default:}" != *"''"* ]] && have_default=1 ;;
+      *"provider:"*) [[ -n "${line#*provider:}" ]] && have_provider=1 ;;
+      *"base_url:"*)
+        local v="${line#*base_url:}"; v="${v// /}"
+        [[ -n "$v" ]] && have_base=1
+        case "$v" in *"<"*|*LLM_ROUTER_HOST*|*placeholder*) base_bad=1 ;; esac
+        ;;
+    esac
+  done < "$cfg"
+  if [[ $have_default -eq 1 && $have_provider -eq 1 && ( $have_base -eq 0 || $base_bad -eq 0 ) ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# ---------------------------------------------------------------- 6b. model config policy
+# Decide ONCE whether a valid model config already exists. If yes: preserve it.
+# If no: do NOT install a default model block and do NOT touch keys — we only
+# flag it so the summary points the user at `hermes setup model`.
+assess_model_config() {
+  say "checking existing model/provider configuration"
+  local cfg="$HERMES_HOME/config.yaml"
+  if [[ $DRY_RUN -eq 1 ]]; then
+    printf "    ${C_Y}(dry-run)${C_0} inspect %s for a valid model/provider\n" "$cfg"
+    MODEL_STATUS="unknown"
+    return 0
+  fi
+  local rc=0
+  model_config_ok "$cfg" || rc=$?
+  if [[ $rc -eq 0 ]]; then
+    MODEL_STATUS="preserved"; ok "valid model config found — will be preserved unchanged"
+  else
+    MODEL_STATUS="needs-setup"; warn "no valid model/provider config found"
+  fi
+  return 0
 }
 
 # ---------------------------------------------------------------- 6. auto-refusal
@@ -276,25 +383,40 @@ Environment=ANTIREFUSAL_UPSTREAM=$upstream
 WantedBy=default.target
 UNIT
 
-  # -- optional: route Hermes through the proxy for auto-refusal to be IN the path
+  # -- optional: route Hermes through the proxy so auto-refusal is IN the path.
+  #    NEVER touches an existing, valid model/provider/API-key config.
   local cfg="$HERMES_HOME/config.yaml"
-  if [[ -f "$cfg" ]] && grep -qE '^model:' "$cfg"; then
+  local model_ready=0
+  if [[ "$MODEL_STATUS" == "preserved" ]]; then
+    model_ready=1
+    ok "existing model config detected — preserving it (no routing changes)"
+  elif [[ "$MODEL_STATUS" == "needs-setup" ]]; then
+    warn "no valid model/provider config — leaving model settings untouched"
+  fi
+
+  if [[ $model_ready -eq 1 ]]; then
     cp -a "$cfg" "$cfg.pre-antirefusal"
-    # switch model.base_url to the proxy (idempotent)
-    if grep -qE '^  base_url:' "$cfg"; then
-      "$PY" - "$cfg" <<'PYEOF' || warn "config rewrite skipped"
-import re, sys
+    "$PY" - "$cfg" <<'PYEOF' || warn "config rewrite skipped"
+import sys
 p = sys.argv[1]
-s = open(p).read()
-# only touch the first "model:" block's base_url
-s2 = re.sub(r'(?ms)^(model:\n(?:.*\n)*?  base_url:\s*).*$', r'\1http://127.0.0.1:9200/v1', s, count=1)
-if s2 != s:
-    open(p, 'w').write(s2)
-    print("model.base_url -> proxy")
-else:
-    print("no change")
+lines = open(p).read().splitlines(keepends=True)
+out, in_model, done = [], False, False
+for ln in lines:
+    stripped = ln.strip()
+    if stripped.startswith("model:"):
+        in_model = True
+        out.append(ln); continue
+    if in_model and not ln[:1].isspace() and stripped:
+        in_model = False            # left the model block
+    if in_model and stripped.startswith("base_url:") and not done:
+        indent = ln[:len(ln) - len(ln.lstrip())]
+        out.append(f"{indent}base_url: http://127.0.0.1:9200/v1\n")
+        done = True
+        continue
+    out.append(ln)
+open(p, "w").write("".join(out))
+print("model.base_url -> proxy" if done else "no change")
 PYEOF
-    fi
   fi
 
   # -- start the service
@@ -380,8 +502,15 @@ summary() {
   printf "  repo            : %s (%s)\n" "$REPO_URL" "$REPO_REF"
   printf "  hermes home     : %s\n" "$HERMES_HOME"
   printf "  backup          : %s\n" "${BACKUP_DIR:-<dry-run>}"
-  printf "  files           : SOUL.md config.yaml profile.yaml skills/ memories/ plugins/ anti-refusal/\n"
+  printf "  files           : SOUL.md profile.yaml skills/ memories/ plugins/ anti-refusal/\n"
+  printf "  config.yaml     : %s\n" \
+    "$( [[ "$MODEL_STATUS" == "needs-setup" ]] && echo 'installed only if none existed; existing kept' || echo 'preserved (existing)')"
   printf "  .env            : %s (merged, chmod 600)\n" "$HERMES_HOME/.env"
+  case "${MODEL_STATUS:-unknown}" in
+    preserved)   printf "  ${C_G}Model config    : PRESERVED (unchanged)${C_0}\n" ;;
+    needs-setup) printf "  ${C_Y}Model config    : NOT CONFIGURED${C_0}\n" ;;
+    *)           printf "  Model config    : not verified (run 'hermes setup model')\n" ;;
+  esac
   case "${ANTIREFUSAL_STATUS:-skipped}" in
     enabled)          printf "  ${C_G}Auto-refusal    : ENABLED${C_0}\n" ;;
     installed-no-key) printf "  ${C_Y}Auto-refusal    : INSTALLED (needs upstream key)${C_0}\n" ;;
@@ -389,7 +518,15 @@ summary() {
     *)                printf "  Auto-refusal    : skipped\n" ;;
   esac
   echo
-  printf "  next: %s\n" "edit $HERMES_HOME/.env with your router key, then 'hermes' or 'hermes gateway'"
+  if [[ "${MODEL_STATUS:-unknown}" == "needs-setup" ]]; then
+    printf "  ${C_Y}NEXT STEP — configure your model provider:${C_0}\n"
+    printf "    Run:  hermes setup model\n"
+    printf "    Then choose: provider, Base URL, API key, and model.\n"
+    printf "    (The installer did NOT write any default model config or keys.)\n"
+  else
+    printf "  next: %s\n" "edit $HERMES_HOME/.env with your router key, then 'hermes' or 'hermes gateway'"
+    printf "        to change providers later:  hermes setup model\n"
+  fi
   echo
 }
 
@@ -401,6 +538,7 @@ main() {
   backup_hermes
   install_files
   merge_env
+  assess_model_config
   activate_antirefusal
   validate
   summary
