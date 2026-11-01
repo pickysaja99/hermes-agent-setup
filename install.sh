@@ -145,7 +145,17 @@ rollback() {
   if [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR/hermes" ]]; then
     warn "restoring ~/.hermes from $BACKUP_DIR/hermes"
     local parked="${HERMES_HOME}.failed"
-    rm -rf "$parked" 2>/dev/null || true
+    # Never destroy the previous failed tree silently: it may be the only copy
+    # of state from an earlier crash. Park it under a timestamp instead, so a
+    # second rollback cannot wipe the evidence a human still needs.
+    if [[ -e "$parked" ]]; then
+      local prev="$parked.$(date +%Y%m%d-%H%M%S)"
+      if mv "$parked" "$prev" 2>/dev/null; then
+        warn "failed tree lama diparkir di $prev (tidak dihapus)"
+      else
+        warn "tidak bisa memindahkan $parked — dilewati, cek manual"
+      fi
+    fi
     # move the broken tree aside (this carries the nested backups/ dir with it)
     mv "$HERMES_HOME" "$parked" 2>/dev/null || true
     # the backup now lives inside the parked dir — restore from there
