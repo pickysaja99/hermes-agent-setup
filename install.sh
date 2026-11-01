@@ -270,11 +270,11 @@ install_files() {
   run cp -a "$S/README.md"   "$HERMES_HOME/SETUP-README.md"
 
   # config.yaml policy (operator rule): the REPO TEMPLATE WINS for everything
-  # EXCEPT four things that belong to the operator and must never be lost:
+  # EXCEPT three operator values that must never be lost:
   #   1. model.base_url   2. model.api_key   3. model.default (model id)
-  #   4. the whole `gateway:` block
-  # Everything else (agent:, tools:, platforms:, approvals:, ...) is taken from
-  # the template so a re-install always converges to the shipped defaults.
+  # Everything else -- including the whole `gateway:` block -- comes from the
+  # template. Gateway credentials live in .env (TELEGRAM_BOT_TOKEN etc.) and are
+  # protected by merge_env, not by this file, so gateway: is safe to overwrite.
   if [[ ! -f "$HERMES_HOME/config.yaml" ]]; then
     run cp "$S/config.yaml" "$HERMES_HOME/config.yaml"
     ok "config.yaml installed (none existed)"
@@ -290,7 +290,7 @@ have = open(dst, encoding="utf-8").read()
 want = open(tpl, encoding="utf-8").read()
 
 def blocks(text):
-    """top-level key -> its full text block (comments above it excluded)."""
+    """top-level key -> its full text block (comment lines above it excluded)."""
     out, cur, name = {}, [], None
     for ln in text.splitlines(keepends=True):
         if ln.strip() and not ln[0].isspace() and not ln.lstrip().startswith("#"):
@@ -305,7 +305,6 @@ def blocks(text):
 
 hb, wb = blocks(have), blocks(want)
 
-# --- the four protected values, lifted out of the operator's current file ---
 def model_val(key, text):
     """value of a key on the model: block at exactly 2-space indent."""
     m = re.search(r"(?m)^model:\s*$", text)
@@ -320,11 +319,15 @@ def model_val(key, text):
     return v
 
 protected = {k: model_val(k, have) for k in ("base_url", "api_key", "default")}
-gateway_block = hb.get("gateway")
 
-# --- build the new file: template blocks, protected values re-applied ---
+# Template blocks win wholesale (gateway: included). Only unknown operator
+# sections survive; the three model values are re-applied below.
 merged = dict(wb)
-mblk = wb.get("model")
+for k, v in hb.items():
+    if k not in merged:
+        merged[k] = v
+
+mblk = merged.get("model")
 if mblk:
     for key, val in protected.items():
         if val is None:
@@ -335,27 +338,16 @@ if mblk:
         else:
             mblk = mblk.rstrip("\n") + "\n  %s: %s\n" % (key, val)
     merged["model"] = mblk
-if gateway_block:
-    merged["gateway"] = gateway_block
-elif "gateway" in wb:
-    pass  # template gateway stands when the operator had none
-
-# blocks the operator has that the template does not: keep them (unknown sections
-# like `aliases:` are not ours to delete).
-for k, v in hb.items():
-    if k not in merged:
-        merged[k] = v
 
 order = list(wb.keys()) + [k for k in hb.keys() if k not in wb]
 out = "".join(merged[k] for k in order if k in merged)
 open(dst, "w", encoding="utf-8").write(out)
 kept = [k for k, v in protected.items() if v]
-print("   config.yaml: template applied; preserved %s%s" % (
-    ", ".join("model." + k for k in kept),
-    " + gateway:" if gateway_block else ""))
+print("   config.yaml: template applied (gateway: too); preserved %s"
+      % ", ".join("model." + k for k in kept))
 PYEOF
     fi
-    ok "config.yaml converged (template wins; base_url/api_key/model/gateway preserved)"
+    ok "config.yaml converged to template; base_url/api_key/model preserved"
   fi
 
   ok "files copied"
@@ -404,7 +396,8 @@ merge_env() {
       # new key from the template: skip obvious placeholders so an install can
       # never inject a demo upstream/key into a configured box
       case "$newval" in
-        ""|"<"*">"*|*"YOUR_"*|*"your_"*|*"changeme"*|*"REPLACE"*|*"xxxx"*) skipped=$((skipped+1)); continue ;;
+        ""|"<"*">"*|*"YOUR_"*|*"your_"*|*"changeme"*|*"CHANGEME"*|*"REPLACE"*|*"xxxx"*) skipped=$((skipped+1)); continue ;;
+        *"placeholder"*|*"PLACEHOLDER"*|*"example"*|*"EXAMPLE"*|*"dummy"*|*"DUMMY"*|*"sk-xxx"*|*"api_key_here"*|*"API_KEY_HERE"*|*"your-"*) skipped=$((skipped+1)); continue ;;
       esac
       printf "%s\n" "$line" >> "$tmp"
       added=$((added+1))

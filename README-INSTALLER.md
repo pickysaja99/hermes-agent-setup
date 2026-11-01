@@ -234,15 +234,19 @@ systemctl --user status antirefusal   # if installed as a unit
 ## Kebijakan konfigurasi saat install / update / reinstall
 
 `install.sh` bersifat idempoten dan **tidak menghapus** konfigurasi router.
-Saat `config.yaml` sudah ada, file itu **tidak diganti utuh** — hanya empat hal
-berikut yang dipertahankan dari file operator, sisanya diambil dari template repo:
+Saat `config.yaml` sudah ada, **template repo menang untuk semua section** —
+hanya tiga nilai milik operator yang dipertahankan:
 
-| Dipertahankan selamanya | Diambil dari template repo |
+| Dipertahankan selamanya | Ditimpa dari template repo |
 |---|---|
 | `model.base_url` | `_config_version`, `context_file_max_chars` |
-| `model.api_key` | `agent:`, `display:`, `compression:`, `toolsets:` |
+| `model.api_key` | `agent:`, `display:`, `compression:` |
 | `model.default` (model id) | `platforms:`, `approvals:`, `memory:` |
-| seluruh blok `gateway:` | semua section lain |
+| | **seluruh blok `gateway:`** |
+
+Blok `gateway:` ikut ditimpa karena **kredensial gateway tidak disimpan di
+`config.yaml`** — token Telegram dan sejenisnya ada di `.env`
+(`TELEGRAM_BOT_TOKEN`), dan `.env` dilindungi oleh `merge_env`.
 
 Section milik operator yang tidak ada di template (mis. `aliases:`,
 `custom_providers:` tambahan) **tidak dihapus**.
@@ -250,6 +254,13 @@ Section milik operator yang tidak ada di template (mis. `aliases:`,
 **SOUL.md** dideploy ulang dari repo setiap kali (repo adalah sumber otoritatif);
 versi lama disimpan sebagai `SOUL.md.pre-install.<timestamp>`.
 **profile.yaml** hanya dipasang bila belum ada — setting lokal tidak direset.
+
+### `.env` selalu aman
+
+`merge_env` tidak pernah mengosongkan nilai yang sudah ada, dan tidak pernah
+memasukkan nilai placeholder (`<...>`, `YOUR_`, `changeme`, `REPLACE`, `xxxx`,
+`placeholder`, `example`, `dummy`, `sk-xxx`, `api_key_here`, `your-`).
+Key baru hanya ditambahkan bila nilainya terlihat nyata.
 
 ### Proxy anti-refusal: satu upstream saja
 
@@ -269,4 +280,4 @@ host lain.
 ### Idempotensi
 
 Jalankan `bash install.sh` berkali-kali: `model.base_url`, `model.api_key`,
-`model.default`, `gateway:`, dan seluruh `.env` tetap byte-identik.
+`model.default`, dan seluruh `.env` tetap byte-identik.
