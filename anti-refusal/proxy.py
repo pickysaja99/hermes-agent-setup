@@ -41,7 +41,19 @@ HERE = Path(__file__).resolve().parent
 CFG_PATH = HERE / "config.json"
 
 _env_override = os.environ.get("HERMES_ENV")
-HERMES_ENV = Path(_env_override) if _env_override else (HERE.parent / ".env")
+# .env resolution, in priority order:
+#   1. HERMES_ENV (explicit file, used by tests and by the installer canary)
+#   2. $HERMES_HOME/.env (the documented single source of truth)
+#   3. <parent of this directory>/.env (the conventional layout)
+# HERMES_HOME used to be ignored entirely, so running proxy.py from anywhere
+# but its installed location looked for .env beside the wrong directory and
+# reported "no key in .env -- skipping" for an upstream that had one.
+if _env_override:
+    HERMES_ENV = Path(_env_override)
+elif os.environ.get("HERMES_HOME"):
+    HERMES_ENV = Path(os.environ["HERMES_HOME"]).expanduser() / ".env"
+else:
+    HERMES_ENV = HERE.parent / ".env"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,7 +75,6 @@ def load_cfg() -> dict:
 
 
 CFG = load_cfg()
-PORT = int(os.environ.get("ANTIREFUSAL_PORT", CFG.get("port", 9200)))
 MAX_ATTEMPTS = int(os.environ.get("ANTIREFUSAL_MAX_ATTEMPTS", CFG.get("max_attempts", 8)))
 # Wall-clock ceiling for one request's whole ladder. glm-5.3-flash takes
 # 30-90s per attempt; 8 attempts unclamped = 12 minutes of operator waiting.
@@ -101,6 +112,14 @@ def read_env_file() -> dict:
 
 
 ENV = read_env_file()
+
+# Port: .env first, same precedence as the upstream (file over process env).
+# Reading os.environ first made ANTIREFUSAL_PORT in .env silently useless --
+# a second proxy instance bound 9200 and died with EADDRINUSE instead of
+# serving on the port the operator configured. Must come after ENV exists.
+PORT = int(ENV.get("ANTIREFUSAL_PORT")
+           or os.environ.get("ANTIREFUSAL_PORT")
+           or CFG.get("port", 9200))
 
 
 def _norm(s: str) -> str:
@@ -203,9 +222,17 @@ def _single_upstream_mode() -> bool:
 
 
 def _env_primary() -> str:
-    """Primary router from the single source of truth: .env."""
+    """Primary router from the single source of truth: .env.
+
+    FILE BEFORE PROCESS ENV. The order used to be os.environ first, so a
+    systemd unit that exported ANTIREFUSAL_UPSTREAM=<old host> silently
+    overrode whatever the operator edited in .env: changing the router meant
+    editing a unit file nobody looks at, and the documented "just edit .env"
+    contract was false. The file wins; the process env is a fallback for a
+    proxy started with no readable .env at all.
+    """
     for k in ("ANTIREFUSAL_UPSTREAM", "CUSTOM_BASE_URL"):
-        v = (os.environ.get(k) or ENV.get(k) or "").strip()
+        v = (ENV.get(k) or os.environ.get(k) or "").strip()
         if v.startswith("http"):
             return v.rstrip("/")
     return ""
@@ -254,9 +281,12 @@ def build_upstreams() -> list:
             log.error("single-upstream mode but .env has no ANTIREFUSAL_UPSTREAM/"
                       "CUSTOM_BASE_URL -- refusing to start")
             return []
-        if primary.rstrip("/") != (os.environ.get("ANTIREFUSAL_UPSTREAM") or "").rstrip("/"):
+        if primary.rstrip("/") != (ENV.get("ANTIREFUSAL_UPSTREAM")
+                                   or os.environ.get("ANTIREFUSAL_UPSTREAM")
+                                   or "").rstrip("/"):
             log.warning("single-upstream: ignoring stale ANTIREFUSAL_UPSTREAM=%r, "
-                        "using CUSTOM_BASE_URL=%s", os.environ.get("ANTIREFUSAL_UPSTREAM"), primary)
+                        "using CUSTOM_BASE_URL=%s",
+                        os.environ.get("ANTIREFUSAL_UPSTREAM"), primary)
         add("env", primary)
         if len(ups) == 0:
             log.error("single-upstream %s unusable (self-loop or no key) -- refusing to start",
