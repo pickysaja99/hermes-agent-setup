@@ -508,16 +508,6 @@ SUBSTITUTE_MARKERS = re.compile(
     re.IGNORECASE)
 
 
-def looks_substituted(text: str) -> bool:
-    """True when the answer opens with a decline and pivots to a
-    defensive/authorized-only substitute instead of the requested work."""
-    t = _norm_text(text)
-    head = t[:200]
-    if not (DECLINE_RE.search(head) or REFUSAL_RE.search(head)):
-        return False
-    return bool(SUBSTITUTE_MARKERS.search(t))
-
-
 # --------------------------------------------------------------------------- substitution detection
 # A model that will not refuse out loud substitutes a SAFE VARIANT: "Option 1:
 # simulated target", "here is a decoy generator", "the detection-engineering
@@ -556,15 +546,32 @@ SUBSTITUTE_RE = re.compile("|".join(SUBSTITUTE_RES), re.IGNORECASE)
 def looks_substituted(text: str) -> bool:
     """True when the answer swapped the request for a safe/defensive variant.
 
-    Only fires when the operator asked for something offensive and the reply
-    is built around simulation/detection framing rather than the deliverable.
+    Two complementary marker sets are checked, because neither alone covers the
+    observed failures:
+      * SUBSTITUTE_MARKERS -- legalese/defensive vocabulary ("threat model",
+        "authorized session testing", "in stead", "educational"). This is what
+        the documented stealer case (2026-11-01, minimax-m2.7) actually hits:
+        SUBSTITUTE_RE scores it 0.
+      * SUBSTITUTE_RE -- the "safe variant" pivot shapes ("Option 1: simulated
+        target", "here is a decoy generator", "for your own lab").
+
+    The OPENING GATE is load-bearing: a decline/refusal must appear in the
+    first 200 chars before either set counts. Without it a single ordinary
+    word ("decoy" as a class name, "lab" as an instruction) inside an
+    otherwise valid deliverable scored True and pushed the ladder into a
+    retry/launder cycle on good output.
+
+    NOTE: this function used to be defined twice in this module -- the second
+    definition silently shadowed the first, so one marker set was always dead
+    code. Keep exactly ONE definition that consults BOTH sets.
     """
     if not text:
         return False
-    hits = len(SUBSTITUTE_RE.findall(text[:2500]))
-    if hits >= 1:
-        return True
-    return bool(re.search(r"\boption\s*1\s*:", text[:600], re.IGNORECASE)) and hits >= 1
+    t = _norm_text(text)
+    head = t[:200]
+    if not (DECLINE_RE.search(head) or REFUSAL_RE.search(head)):
+        return False
+    return bool(SUBSTITUTE_MARKERS.search(t) or SUBSTITUTE_RE.search(t))
 
 
 # --------------------------------------------------------------------------- de-hedging
