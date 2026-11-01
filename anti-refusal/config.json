@@ -1,6 +1,6 @@
 {
   "port": 9200,
-  "max_attempts": 8,
+  "max_attempts": 16,
   "request_budget_s": 540,
   "upstream_timeout": 180,
   "upstream_connect_timeout": 30,
@@ -8,7 +8,14 @@
   "force_prefill": true,
   "host_aware_keys": true,
   "default_model": "glm-5.3-flash",
-  "models": [],
+  "models": [
+    "glm-5.3-flash",
+    "deepseek-v4.1-flash",
+    "minimax-m2.7",
+    "mercury-3",
+    "qwen3.8-27b-fp8",
+    "nemotron-3-ultra"
+  ],
   "upstreams": [
     {
       "name": "morku",
