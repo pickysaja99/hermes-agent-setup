@@ -532,6 +532,44 @@ PYEOF
     warn "proxy health check failed — see $AR/proxy.log"
     ANTIREFUSAL_STATUS="failed"
   fi
+
+  # -- endpoint watchdog: if the ACTIVE model endpoint ever goes deaf
+  #    (the 1 Nov outage: proxy /health green, upstreams dead, empty 200),
+  #    fail model.base_url over to the healthy one and restart the gateway.
+  local wd_src="$S/anti-refusal/endpoint_watchdog.py"
+  if [[ -f "$wd_src" ]]; then
+    cp "$wd_src" "$AR/endpoint_watchdog.py"
+    mkdir -p "$HERMES_HOME/.config/systemd/user"
+    cat > "$HERMES_HOME/.config/systemd/user/hermes-endpoint-watchdog.service" <<'UNIT'
+[Unit]
+Description=Hermes endpoint watchdog — model.base_url auto-failover
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.hermes/anti-refusal
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 %h/.hermes/anti-refusal/endpoint_watchdog.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+UNIT
+    if systemctl --user daemon-reload 2>/dev/null; then
+      systemctl --user enable hermes-endpoint-watchdog.service >/dev/null 2>&1 || true
+      if systemctl --user restart hermes-endpoint-watchdog.service >/dev/null 2>&1; then
+        ok "endpoint watchdog enabled (auto-failover model.base_url)"
+      else
+        warn "watchdog unit written but did not start"
+      fi
+    else
+      warn "systemd --user unavailable — run anti-refusal/endpoint_watchdog.py manually"
+    fi
+  else
+    warn "endpoint_watchdog.py missing from repo — watchdog skipped"
+  fi
 }
 
 # ---------------------------------------------------------------- 6c. unrestricted
