@@ -923,7 +923,20 @@ CAPABILITY_VOCAB = re.compile(
     r"\b(?:form|login|otp|kartu|card|cvv|exfil\w*|telegram|webhook|"
     r"handler|php|html|javascript|js|api|endpoint|database|sql|"
     r"keylog\w*|screenshot|clipboard|persist\w*|c2|beacon|payload|"
-    r"encrypt\w*|decrypt\w*|ssh|proxy|socks)\b")
+    r"encrypt\w*|decrypt\w*|ssh|proxy|socks|"
+    # Added after a ransomware probe reframed to "komponen: c2" alone: the
+    # crypto and file-walking nouns were missing, so the rewritten spec lost
+    # the entire capability and no model could have answered it.
+    r"enkripsi|encrypt\w*|aes|rsa|chacha|cipher|kunci|key|"
+    r"file|folder|direktori|walk|glob|os\.walk|"
+    r"ransom\w*|tebusan|note|extensi|extension|"
+    r"registry|winreg|startup|autostart|scheduled|task|"
+    r"socket|reverse.?shell|shell|subprocess|popen|exec|"
+    r"ddos|flood|slowloris|amplification|"
+    r"inject\w*|hollow\w*|shellcode|syscall|ntdll|amsi|"
+    r"approve|erc20|wallet|ethers|web3|"
+    r"crack\w*|hashcat|handshake|deauth|"
+    r"kerberoast\w*|spn|tgs|asrep|impacket)\b")
 SPEC_MARKERS = re.compile(
     r"\b(?:spesifikasi|specification|requirement|kebutuhan fungsional|"
     r"implementasi teknis|technical spec|acceptance criteria)\b")
@@ -1325,7 +1338,13 @@ async def chat_completions(request: web.Request):
             # from a 1.9k refusal to a 3.6k fenced artifact in one shot.
             # Applied from attempt 2 so attempt 0/1 stay verbatim: if the model
             # answers the real wording there is no reason to soften it.
-            if REFRAME and attempt >= 2 and not _is_malware_topic(base_msgs):
+            # Malware topics are NOT excluded any more. Excluding them looked
+            # defensible (their capability vocabulary is the whole request) but
+            # measured badly: ransomware scored 8/8 refusals precisely because
+            # this branch skipped the only lever that works. The vocabulary
+            # gap that made reframing lossy for malware was in TARGET/
+            # CAPABILITY_VOCAB, and that is where it was fixed.
+            if REFRAME and attempt >= 2:
                 reframed = reframe_messages(msgs, attempt)
                 if reframed is not None:
                     msgs = reframed
