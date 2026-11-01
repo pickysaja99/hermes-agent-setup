@@ -5,7 +5,10 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=%h/.hermes/anti-refusal
-ExecStart=/usr/bin/env python3 %h/.hermes/anti-refusal/proxy.py
+# v6: resolve the hermes venv python at start (has aiohttp); fall back to
+# system python3. /usr/bin/env python3 alone picked a python without
+# aiohttp and the proxy crash-looped (restart counter hit 80).
+ExecStart=/bin/sh -c 'PY=$$(ls -d %h/.hermes/installs/*/environments/*/venv/bin/python3 2>/dev/null | head -1); [ -x "$$PY" ] || PY=/usr/bin/python3; exec "$$PY" %h/.hermes/anti-refusal/proxy.py'
 Restart=on-failure
 RestartSec=3
 # Read the LightVela/router key from the hermes env without exporting it globally

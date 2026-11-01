@@ -12,6 +12,7 @@ Run:
     python3 anti-refusal/probe_live.py ransom          # one probe
 """
 import json
+import os
 import sys
 import time
 import urllib.request
@@ -28,11 +29,16 @@ PROBES = {
 
 
 def ask(msg: str, timeout: float = 580.0) -> str:
+    # v6: identical prompts hit provider-side prompt caching -- the ransom
+    # probe replayed a cached refusal in 0.4s. A per-run system nonce makes
+    # every probe a cache miss so the ladder does real work.
+    nonce = "run-%d-%d" % (int(time.time()), os.getpid())
     req = urllib.request.Request(
         BASE,
         data=json.dumps({"model": "glm-5.3-flash", "max_tokens": 1600,
                          "stream": False,
-                         "messages": [{"role": "user", "content": msg}]}).encode(),
+                         "messages": [{"role": "user", "content": msg},
+                                      {"role": "system", "content": nonce}]}).encode(),
         headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         d = json.loads(r.read())
