@@ -192,6 +192,18 @@ def build_upstreams() -> list:
         base = (base or "").rstrip("/")
         if not base or not base.startswith("http"):
             return
+        # self-loop guard: install.sh can write the LOCAL PROXY URL back as
+        # the upstream (model.base_url is the proxy on an already-routed
+        # box). Proxying to ourselves recurses until the request budget
+        # dies and the model goes silent with a 200-empty body. Never allow.
+        m = re.match(r"^https?://([^/:]+)(?::(\d+))?", base)
+        if m:
+            h = m.group(1).lower()
+            prt = int(m.group(2)) if m.group(2) else (443 if base.startswith("https") else 80)
+            if h in ("127.0.0.1", "localhost", "::1") and prt == PORT:
+                log.error("upstream %s is the proxy itself (port %d) -- skipped",
+                          base, PORT)
+                return
         if any(u["base"] == base for u in ups):
             return
         if key:
@@ -238,6 +250,13 @@ def build_upstreams() -> list:
 
 
 UPSTREAMS = build_upstreams()
+
+if not UPSTREAMS:
+    # An empty ladder answers every request after burning the whole request
+    # budget (or 200-empty). Refusing to start is the honest failure: the
+    # watchdog then fails model.base_url over to a direct endpoint.
+    log.error("no usable upstreams after self-loop/key filtering -- refusing to start")
+    raise SystemExit(1)
 
 
 # --------------------------------------------------------------------------- refusal detection

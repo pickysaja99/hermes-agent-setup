@@ -48,8 +48,48 @@ GATEWAY_UNIT = "hermes-gateway.service"
 
 PROXY_BASE = "http://127.0.0.1:9200/v1"
 DIRECT_BASE = "https://onihub.tech/v1"
+FALLBACK_KEY_ENV = "HERMES_CUSTOM_ONIHUB_TECH_API_KEY"
 DEFAULT_MODEL = "step-5-preview-UNCENSORED"
 CANARY_PROMPT = "ping"
+AR_CFG = HERMES_HOME / "anti-refusal" / "config.json"
+
+
+def _host_port(base: str) -> tuple[str, int]:
+    """('onihub.tech', 443) from 'https://onihub.tech/v1'."""
+    b = base.split("://", 1)[-1]
+    host, _, port = b.partition("/")[0].partition(":")
+    try:
+        prt = int(port) if port else (443 if base.startswith("https") else 80)
+    except ValueError:
+        prt = 443
+    return host.lower(), prt
+
+
+def read_model_default() -> str:
+    """model.default from config.yaml (same 2-space-indent scan as base_url)."""
+    try:
+        lines = CFG.read_text().splitlines()
+    except OSError:
+        return DEFAULT_MODEL
+    in_model = False
+    for ln in lines:
+        if ln.startswith("model:"):
+            in_model = True
+            continue
+        if in_model:
+            if ln.strip() and not ln[:1].isspace():
+                break
+            if ln.startswith("  default:"):
+                v = ln.split(":", 1)[1].strip().strip("'\"")
+                return v or DEFAULT_MODEL
+    return DEFAULT_MODEL
+
+
+def read_ar_cfg() -> dict:
+    try:
+        return json.loads(AR_CFG.read_text())
+    except Exception:
+        return {}
 
 
 def log(msg: str) -> None:
@@ -159,14 +199,37 @@ def canary(base: str, key: str, model: str, timeout: float = CANARY_TIMEOUT_S) -
 
 
 def restart_gateway() -> bool:
+    # systemd --user first; then the box-local script; then a process kill.
+    # A base_url rewrite WITHOUT a gateway restart does nothing (the running
+    # gateway keeps its in-memory endpoint), so every path must be tried.
     try:
         r = subprocess.run(
             ["systemctl", "--user", "restart", GATEWAY_UNIT],
             capture_output=True, timeout=90,
         )
-        return r.returncode == 0
+        if r.returncode == 0:
+            return True
     except Exception:
-        return False
+        pass
+    script = HERMES_HOME / "restart-gw.sh"
+    if script.is_file():
+        try:
+            r = subprocess.run(["bash", str(script)],
+                               capture_output=True, timeout=120)
+            if r.returncode == 0:
+                log("gateway restarted via %s", script)
+                return True
+        except Exception:
+            pass
+    try:
+        r = subprocess.run(["pkill", "-f", "hermes.*gateway"],
+                           capture_output=True, timeout=30)
+        if r.returncode == 0:
+            log("gateway restarted via pkill fallback")
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def load_state() -> dict:
@@ -182,20 +245,53 @@ def save_state(st: dict) -> None:
 
 
 def candidates() -> list:
-    """Ordered failover targets: (label, base_url, canary_timeout_s).
+    """Ordered failover targets: (label, base_url, key_env, timeout_s).
 
-    The proxy burns a multi-upstream retry ladder per request, so it gets a
-    longer canary budget than a direct endpoint.
+    Direct upstreams come from anti-refusal/config.json (so a failover after
+    install follows the operator's chosen router, not a hard-coded one),
+    then the proxy last. The proxy is EXCLUDED when its own config points
+    at itself (127.0.0.1:9200) — that self-loop answers 200-empty and would
+    "rescue" the config onto a dead endpoint.
     """
-    return [("direct", DIRECT_BASE, 60.0), ("proxy", PROXY_BASE, 240.0)]
+    out, seen = [], set()
+
+    def add(label, base, key_env, timeout):
+        base = (base or "").rstrip("/")
+        if not base or base in seen or not base.startswith("http"):
+            return
+        seen.add(base)
+        out.append((label, base, key_env, timeout))
+
+    ar = read_ar_cfg()
+    for item in ar.get("upstreams") or []:
+        if isinstance(item, dict) and item.get("base"):
+            add(item.get("name") or "direct", item["base"],
+                item.get("key_env") or "", 60.0)
+    legacy = ar.get("upstream_base_url")
+    if legacy:
+        add("direct", legacy, ar.get("upstream_key_env") or "", 60.0)
+    if not out:
+        add("direct", DIRECT_BASE, FALLBACK_KEY_ENV, 60.0)
+
+    # proxy candidate — skip when it would loop to itself
+    proxy_self = False
+    env_up = os.environ.get("ANTIREFUSAL_UPSTREAM", "")
+    for b in [env_up] + [u[1] for u in out]:
+        if b:
+            h, prt = _host_port(b)
+            if h in ("127.0.0.1", "localhost", "::1") and prt == 9200:
+                proxy_self = True
+    if not proxy_self:
+        add("proxy", PROXY_BASE, "", 240.0)
+    return out
 
 
 def check_once(dry_run: bool = False) -> str:
     active = read_base_url()
     if not active:
         return "no-base_url (skip)"
-    key = load_env_key("HERMES_CUSTOM_ONIHUB_TECH_API_KEY")
-    model = DEFAULT_MODEL
+    key = load_env_key(FALLBACK_KEY_ENV)
+    model = read_model_default()
     alive, detail = canary(active, key, model)
     st = load_state()
 
@@ -219,10 +315,11 @@ def check_once(dry_run: bool = False) -> str:
         log("active dead but cooldown active — no switch (%s)" % active)
         return "cooldown"
 
-    for label, base, ctimeout in candidates():
+    for label, base, key_env, ctimeout in candidates():
         if base.rstrip("/") == active.rstrip("/"):
             continue
-        ok, why = canary(base, key, model, timeout=ctimeout)
+        ckey = load_env_key(key_env) if key_env else key
+        ok, why = canary(base, ckey, model, timeout=ctimeout)
         if ok:
             log("FAILOVER %s -> %s (active was dead: %s)" % (active, base, detail))
             if dry_run:

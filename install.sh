@@ -274,12 +274,12 @@ _env_set() {  # key value — replace the line in place, else append
   fi
 }
 
-_model_field() {  # field -> value from the config.yaml model: block
+_model_field() {  # field -> model: block OWN key (exact 2-space; aliases at 4+ excluded)
   local cfg="$HERMES_HOME/config.yaml"
   [[ -f "$cfg" ]] || return 0
   sed -n '/^model:/,/^[^[:space:]]/p' "$cfg" 2>/dev/null \
-    | grep -m1 -E "^[[:space:]]+$1:" \
-    | sed -E "s/^[[:space:]]+$1:[[:space:]]*//; s/^'//; s/'$//; s/^\"//; s/\"$//" || true
+    | grep -m1 -E "^  $1:" \
+    | sed -E "s/^  $1:[[:space:]]*//; s/^'//; s/'$//; s/^\"//; s/\"$//" || true
 }
 
 _ask() {  # var prompt default — empty input keeps the default
@@ -388,10 +388,22 @@ configure_upstream() {
   cur_model="$(_model_field default)"
   [[ -n "$cur_keyenv" ]] && cur_key="$(_env_get "$cur_keyenv")"
 
-  local def_base="${cur_base:-$(_env_get ANTIREFUSAL_UPSTREAM)}"
-  def_base="${def_base:-$(_env_get CUSTOM_BASE_URL)}"
-  def_base="${def_base:-https://onihub.tech/v1}"
-  def_base="${def_base%/}"
+  # The local anti-refusal proxy (127.0.0.1:9200) is NOT an upstream. On an
+  # already-routed box model.base_url IS the proxy, so the fallback chain
+  # below must skip loopback hosts or install.sh writes a self-looping
+  # anti-refusal config and the model goes silent.
+  _san_base() {  # value -> value (no trailing slash), empty when loopback
+    local b="${1%/}"
+    case "$b" in
+      http://127.0.0.1*|http://localhost*|https://127.0.0.1*|https://localhost*) echo "" ;;
+      *) echo "$b" ;;
+    esac
+  }
+  local def_base
+  def_base="$(_san_base "$cur_base")"
+  [[ -z "$def_base" ]] && def_base="$(_san_base "$(_env_get ANTIREFUSAL_UPSTREAM)")"
+  [[ -z "$def_base" ]] && def_base="$(_san_base "$(_env_get CUSTOM_BASE_URL)")"
+  [[ -z "$def_base" ]] && def_base="https://onihub.tech/v1"
 
   local base="${SETUP_BASE_URL:-}" key="${SETUP_API_KEY:-}" model="${SETUP_MODEL:-}" models=""
 
@@ -438,6 +450,46 @@ configure_upstream() {
     SETUP_MODEL_CHOSEN=""; SETUP_BASE_RESOLVED=""
     return 0
   fi
+
+  # Hard guard: the proxy itself is never a valid upstream (self-loop).
+  case "$base" in
+    http://127.0.0.1*|http://localhost*|https://127.0.0.1*|https://localhost*)
+      warn "upstream '$base' adalah proxy lokal — DITOLAK (self-loop)"
+      warn "  config.yaml & anti-refusal/config.json tidak diubah (config lama tetap dipakai)"
+      SETUP_MODEL_CHOSEN=""; SETUP_BASE_RESOLVED=""
+      return 0
+      ;;
+  esac
+
+  # A missing key would write api_key: ${EMPTY_ENV} -> gateway 401 -> model
+  # bisu. Never rewrite config without a key to validate.
+  if [[ -z "$key" ]]; then
+    warn "API key kosong — config.yaml & anti-refusal/config.json tidak diubah"
+    warn "  set SETUP_API_KEY (non-TTY) atau isi di prompt; lalu jalankan ulang"
+    SETUP_MODEL_CHOSEN=""; SETUP_BASE_RESOLVED=""
+    return 0
+  fi
+
+  # Live chat canary BEFORE touching config.yaml. A key that lists /models
+  # but fails chat (or a dead router, or a typo'd model id) must never
+  # become the new model.base_url. Browser UA is required: onihub.tech sits
+  # behind Cloudflare, which 1010s the curl default UA.
+  local cbody cok=0
+  cbody="$(curl -s -m 60 -X POST "$base/chat/completions" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $key" \
+    -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" \
+    -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":8,\"stream\":false}" 2>/dev/null || true)"
+  if [[ -n "$cbody" ]] && printf '%s' "$cbody" | grep -q '"content"'; then
+    cok=1
+  fi
+  if [[ $cok -eq 0 ]]; then
+    warn "canary chat ke $base (model=$model) GAGAL — config.yaml & anti-refusal/config.json TIDAK diubah"
+    warn "  config lama tetap dipakai; perbaiki base URL / API key / model id lalu jalankan ulang"
+    SETUP_MODEL_CHOSEN=""; SETUP_BASE_RESOLVED=""
+    return 0
+  fi
+  ok "canary chat ok — $base menjawab untuk model=$model"
 
   local host slug keyenv
   host="$(printf '%s' "$base" | sed -E 's#^https?://##; s#/.*##')"
@@ -841,9 +893,10 @@ for ln in lines:
         out.append(ln); continue
     if in_model and not ln[:1].isspace() and stripped:
         in_model = False            # left the model block
-    if in_model and stripped.startswith("base_url:") and not done:
-        indent = ln[:len(ln) - len(ln.lstrip())]
-        out.append(f"{indent}base_url: http://127.0.0.1:{port}/v1\n")
+    if in_model and ln.startswith("  base_url:") and not done:
+        # exact 2-space indent: the model block's OWN base_url, never a
+        # nested alias/provider entry (those sit at 4+ spaces)
+        out.append(f"  base_url: http://127.0.0.1:{port}/v1\n")
         done = True
         continue
     out.append(ln)
