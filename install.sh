@@ -74,6 +74,11 @@ rollback() {
     rm -f "$HOME/.config/systemd/user/antirefusal.service" 2>/dev/null || true
     systemctl --user daemon-reload >/dev/null 2>&1 || true
   fi
+  # stop a fallback background proxy if we started one
+  if [[ -n "${HERMES_HOME:-}" && -f "$HERMES_HOME/anti-refusal/proxy.pid" ]]; then
+    kill "$(cat "$HERMES_HOME/anti-refusal/proxy.pid")" 2>/dev/null || true
+    rm -f "$HERMES_HOME/anti-refusal/proxy.pid" 2>/dev/null || true
+  fi
   # restore backup if we have one
   if [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR/hermes" ]]; then
     warn "restoring ~/.hermes from $BACKUP_DIR/hermes"
@@ -427,13 +432,27 @@ print("model.base_url -> proxy" if done else "no change")
 PYEOF
   fi
 
-  # -- start the service
-  if systemctl --user daemon-reload 2>/dev/null; then
+  # -- start the service: prefer systemd --user, else fall back to a plain
+  #    background process (many VPS/containers have no systemd user session).
+  local started=0
+  if systemctl --user daemon-reload 2>/dev/null && \
+     systemctl --user show-environment >/dev/null 2>&1; then
     systemctl --user enable antirefusal.service >/dev/null 2>&1 || true
-    systemctl --user restart antirefusal.service >/dev/null 2>&1 || \
-      systemctl --user start antirefusal.service >/dev/null 2>&1 || true
-  else
-    warn "systemd --user not available — start manually: $PY $AR/proxy.py"
+    if systemctl --user restart antirefusal.service >/dev/null 2>&1 || \
+       systemctl --user start antirefusal.service >/dev/null 2>&1; then
+      started=1
+      ok "started via systemd --user (antirefusal.service)"
+    fi
+  fi
+
+  if [[ $started -eq 0 ]]; then
+    warn "systemd --user unavailable — launching the proxy as a background process"
+    pkill -f "$AR/proxy.py" 2>/dev/null || true
+    sleep 1
+    ANTIREFUSAL_UPSTREAM="$upstream" ANTIREFUSAL_PORT="$ar_port" \
+      nohup "$PY" "$AR/proxy.py" >"$AR/proxy.out" 2>&1 &
+    echo $! > "$AR/proxy.pid"
+    ok "started background proxy (pid $(cat "$AR/proxy.pid"))"
   fi
 
   # -- VERIFY: health endpoint must answer {"ok": true}
