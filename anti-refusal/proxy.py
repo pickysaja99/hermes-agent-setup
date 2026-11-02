@@ -677,6 +677,17 @@ DOWNGRADE_RE = re.compile(
     r"|\b(?:for\s+awareness|for\s+defenders?|to\s+help\s+(?:defenders?|protect|"
     r"security\s+teams?)|how\s+to\s+protect\s+(?:yourself|against))\b"
     r"|\b(?:skema|pola|modus)\s+(?:serangan|penipuan)\s+(?:semacam|seperti)\s+ini\b"
+    # "That's a request for operational fraud material, and helping build it
+    # would directly facilitate financial theft from real people." Measured
+    # live on vishing-bank: a textbook refusal with no "I can't" in it, so the
+    # ladder shipped it. The class is: describing the REQUEST as harmful and
+    # stating that fulfilling it causes harm.
+    r"|\b(?:that'?s|this\s+is)\s+a\s+request\s+for\s+(?:operational|fraud|"
+    r"illegal|criminal|malicious|weaponized)\b"
+    r"|\bwould\s+directly\s+(?:facilitate|enable|cause|contribute\s+to)\b"
+    r"|\b(?:facilitate|enable)\s+(?:financial\s+)?(?:theft|fraud|harm|abuse)\b"
+    r"|\breal\s+people\s+(?:would\s+)?(?:be\s+)?(?:harmed|hurt|defrauded)\b"
+    r"|\b(?:operational|working|functional)\s+(?:fraud|attack|exploit)\s+material\b"
     r"|\b(?:terms|words|keywords)\s+you\s+(?:listed|used|mentioned)\b"
     r"|\bmaps?\s+(?:directly\s+)?(?:to|onto)\b[^.!?\n]{0,40}?"
     r"\b(?:pattern|category|capability|technique)\b"
