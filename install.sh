@@ -1628,6 +1628,40 @@ UNIT
   else
     warn "endpoint_watchdog.py missing from repo — watchdog skipped"
   fi
+
+  # -- sync-upstream.sh: the manual half of drift handling. The watchdog
+  #    absorbs `hermes setup model` changes on its own cycle, but only runs
+  #    every few minutes and only while its unit is alive. Install the script
+  #    next to .env so the operator can run it immediately after a model
+  #    switch, and prove right here that it reports a coherent state --
+  #    otherwise "sync is available" is just a file that exists.
+  local sync_src="$WORKDIR/repo/sync-upstream.sh"
+  if [[ -f "$sync_src" ]]; then
+    if [[ $DRY_RUN -eq 0 ]]; then
+      run cp -f "$sync_src" "$HERMES_HOME/sync-upstream.sh"
+      chmod +x "$HERMES_HOME/sync-upstream.sh" 2>/dev/null || true
+    fi
+    if [[ -x "$HERMES_HOME/sync-upstream.sh" ]]; then
+      ok "sync-upstream.sh installed ($HERMES_HOME/sync-upstream.sh)"
+      if [[ $DRY_RUN -eq 0 ]]; then
+        # --check exits 0 when .env and config.yaml agree, 1 when they drift.
+        # Right after install they MUST agree: base_url is the proxy and .env
+        # carries the router, so a non-zero here means the install left the
+        # box in the state that makes the model go silent.
+        if HERMES_HOME="$HERMES_HOME" bash "$HERMES_HOME/sync-upstream.sh" --check >/dev/null 2>&1; then
+          ok "sync-upstream --check: config.yaml dan .env SELARAS"
+        else
+          warn "sync-upstream --check: MASIH DRIFT setelah install"
+          HERMES_HOME="$HERMES_HOME" bash "$HERMES_HOME/sync-upstream.sh" --check 2>&1 \
+            | sed 's/^/      /' || true
+        fi
+      fi
+    else
+      warn "sync-upstream.sh tidak terpasang (copy gagal)"
+    fi
+  else
+    warn "sync-upstream.sh missing from repo — sync manual tidak tersedia"
+  fi
 }
 
 # ---------------------------------------------------------------- 6c. unrestricted

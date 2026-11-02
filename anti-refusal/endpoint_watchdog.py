@@ -218,23 +218,22 @@ def log(msg: str) -> None:
 def key_for_host(base: str) -> str:
     """Bearer for `base`, matched by host from .env (HERMES_CUSTOM_<HOST>_API_KEY).
 
-    Falls back to the single upstream key when only one key exists, so a
-    renamed env var cannot leave the canary/ failover with an empty bearer.
+    Host-exact matching ONLY. This used to borrow any *_API_KEY whose name
+    shared a word with the host, and finally fell back to the primary
+    upstream's key. On a router switch that handed api.gonkarouter.io the
+    mahicenter credential, so the canary reported the endpoint alive and the
+    real request died 401 invalid_api_key -- the failure this whole change
+    exists to remove. A wrong key is worse than a missing one: missing is
+    detected, wrong is sent.
     """
     env = read_env()
     host = _host_port(base)[0] if base else ""
     slug = re.sub(r"[^A-Za-z0-9]+", "_", host).upper()
-    cands = ["HERMES_CUSTOM_%s_API_KEY" % slug, "CUSTOM_API_KEY"]
-    for c in cands:
+    if not slug:
+        return ""
+    for c in ("HERMES_CUSTOM_%s_API_KEY" % slug, "CUSTOM_API_KEY"):
         if env.get(c):
             return env[c]
-    for k, v in env.items():
-        if v and len(v) >= 8 and ("_API_KEY" in k or k.endswith("_KEY")):
-            if slug and slug.split("_")[0] and slug.split("_")[0] in k:
-                return v
-    _b, key_env = primary_upstream()
-    if key_env and env.get(key_env):
-        return env[key_env]
     return ""
 
 
@@ -394,6 +393,15 @@ def absorb_drift() -> bool:
             log("drift: model %s is not served by %s -- using %s"
                 % (model, active, alt))
             model = alt
+
+    # A router with no key in .env is the 401 state, and absorbing it would
+    # make it the proxy's only upstream: every request then fails
+    # "invalid API key" with no way back. Refuse to absorb, and say what to
+    # do instead -- the operator just changed endpoints and the credential
+    # has not landed in .env yet.
+    if not key_for_host(active):
+        log("drift: %s has NO key in .env -- not absorbing (401 would follow)" % active)
+        return False
     changed = write_env_key("ANTIREFUSAL_UPSTREAM", active.rstrip("/"))
     changed = write_env_key("ANTIREFUSAL_MODEL", model) or changed
     log("drift: config.yaml had upstream %s (model %s) -- absorbed into .env"
