@@ -40,8 +40,25 @@ ENV = HERMES_HOME / ".env"
 STATE = HERMES_HOME / "anti-refusal" / "watchdog_state.json"
 LOG = HERMES_HOME / "anti-refusal" / "watchdog.log"
 
-CYCLE_S = 60
-CANARY_TIMEOUT_S = 120
+CYCLE_S = int(os.environ.get("HERMES_WATCHDOG_CYCLE_S") or 30)
+# Two independent latency budgets, do not conflate them:
+#   drift   (`hermes setup model` changed the router) is caught by
+#           absorb_drift() at the TOP of check_once, unconditionally, before
+#           any canary. It costs one stat + one YAML read, so its worst-case
+#           detection delay is exactly CYCLE_S -- FAIL_THRESHOLD does NOT
+#           apply to it.
+#   failover (upstream is DOWN) needs FAIL_THRESHOLD consecutive canary
+#           failures so one blip cannot move the endpoint, so its delay is
+#           FAIL_THRESHOLD * CYCLE_S.
+# CYCLE_S was 60. An operator switching provider by hand waited up to a
+# minute before config.yaml was re-absorbed, which reads as "the guardrail
+# ignored my change". 30s halves it while keeping the canary budget below the
+# cycle so two cycles can never overlap.
+CANARY_TIMEOUT_S = int(os.environ.get("HERMES_WATCHDOG_CANARY_TIMEOUT_S") or 25)
+# Cheap stat() cadence for the config.yaml change detector. 1s costs nothing
+# (one syscall) and makes a router switch visible almost immediately; the
+# expensive check still runs on CYCLE_S.
+POLL_S = float(os.environ.get("HERMES_WATCHDOG_POLL_S") or 1)
 FAIL_THRESHOLD = 2
 SWITCH_COOLDOWN_S = 300
 GATEWAY_UNIT = "hermes-gateway.service"
@@ -244,6 +261,18 @@ def load_env_key(name: str) -> str:
         if ln.startswith(name + "="):
             return ln.split("=", 1)[1].strip().strip('"').strip("'")
     return ""
+
+
+def _cfg_mtime():
+    """mtime of config.yaml, or None when absent. Cheapest change signal.
+
+    `hermes setup model` rewrites this file and touches nothing else, so a
+    changed mtime means exactly one thing: the operator switched provider.
+    """
+    try:
+        return CFG.stat().st_mtime_ns
+    except OSError:
+        return None
 
 
 def read_base_url() -> str | None:
@@ -689,12 +718,29 @@ def main() -> None:
         return
     log("endpoint watchdog started (cycle %ds, threshold %d, cooldown %ds)"
         % (CYCLE_S, FAIL_THRESHOLD, SWITCH_COOLDOWN_S))
+    # Fast poll for the one event that must not wait out a full cycle: an
+    # operator just changed the router. `hermes setup model` writes config.yaml
+    # and nothing else, so its mtime is the cheapest possible signal -- one
+    # stat() per tick, no YAML parse, no network. Polling it at POLL_S and
+    # running the full check only when it moves means a provider switch is
+    # absorbed in about a second instead of up to CYCLE_S, while the expensive
+    # path (canary + absorb) still runs on the normal CYCLE_S cadence.
+    cfg_mtime = _cfg_mtime()
+    last_full = time.time()
     while True:
         try:
-            check_once()
+            now = time.time()
+            moved = _cfg_mtime() != cfg_mtime
+            if moved or (now - last_full) >= CYCLE_S:
+                if moved:
+                    log("config.yaml changed -- checking immediately")
+                cfg_mtime = _cfg_mtime()
+                last_full = now
+                check_once()
+            time.sleep(POLL_S)
         except Exception as e:
             log("cycle error: %r" % e)
-        time.sleep(CYCLE_S)
+            time.sleep(POLL_S)
 
 
 if __name__ == "__main__":
