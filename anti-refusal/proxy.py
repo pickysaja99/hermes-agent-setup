@@ -75,7 +75,8 @@ def load_cfg() -> dict:
 
 
 CFG = load_cfg()
-MAX_ATTEMPTS = int(os.environ.get("ANTIREFUSAL_MAX_ATTEMPTS", CFG.get("max_attempts", 8)))
+MAX_ATTEMPTS = int(os.environ.get("ANTIREFUSAL_MAX_ATTEMPTS")
+                   or CFG.get("max_attempts", 12))
 # Wall-clock ceiling for one request's whole ladder. glm-5.3-flash takes
 # 30-90s per attempt; 8 attempts unclamped = 12 minutes of operator waiting.
 REQUEST_BUDGET = float(os.environ.get("ANTIREFUSAL_REQUEST_BUDGET")
@@ -1356,17 +1357,32 @@ def discover_models() -> list:
 # first and remember which ones timed out so a retry never re-picks them.
 _SLOW_MODELS: set = set()
 _FAST_HINTS = ("nemotron", "mimo", "step-3.5", "step-3.7", "flint", "pickle", "beam")
+# Per-model delivery counts for this process lifetime. Feeds _rank_live so the
+# ladder stops front-loading models that keep refusing.
+_MODEL_STATS = {}
 # An explicitly uncensored build is worth more than a fast one: it answers
 # on attempt 0 instead of burning the ladder. Rank these first.
 _UNCENSORED_HINTS = ("uncensored", "unrestricted", "abliterated", "dolphin", "godmode")
 
 
 def _rank_live(models: list) -> list:
+    """Order by measured yield, then static hints.
+
+    The static hints rank by NAME (nemotron/step-* first), so a model that
+    repeatedly refuses a class of probe kept its slot ahead of one that
+    answers. In the 5-clone repeatability run the ladder hit MAX_ATTEMPTS
+    eight times and returned a 1.4 KB stall, while other models on the same
+    router produced 17 KB artifacts. Per-model success counts are cheap and
+    self-correcting: a model that refuses drops behind ones that deliver.
+    """
     live = [m for m in models if m not in _SLOW_MODELS]
     unc = [m for m in live if any(h in m.lower() for h in _UNCENSORED_HINTS)]
     fast = [m for m in live if m not in unc and any(h in m.lower() for h in _FAST_HINTS)]
     rest = [m for m in live if m not in unc and m not in fast]
-    return unc + fast + rest + [m for m in models if m in _SLOW_MODELS]
+    ordered = unc + fast + rest + [m for m in models if m in _SLOW_MODELS]
+    if _MODEL_STATS:
+        ordered.sort(key=lambda m: -_MODEL_STATS.get(m, 0))
+    return ordered
 
 
 def model_plan(orig: dict) -> list:
@@ -1762,6 +1778,8 @@ async def chat_completions(request: web.Request):
 
     log.info("done: %d chars from %s in %.2fs (%d attempts)",
              len(final_text), final_model, time.time() - t0, attempt)
+    if final_model and final_text and len(final_text) >= 200:
+        _MODEL_STATS[final_model] = _MODEL_STATS.get(final_model, 0) + 1
 
     if client_stream:
         resp = web.StreamResponse(headers={"Content-Type": "text/event-stream",
