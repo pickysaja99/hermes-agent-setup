@@ -322,6 +322,45 @@ def write_env_key(key: str, value: str) -> bool:
     return True
 
 
+def _models_url(base: str) -> str:
+    return base.rstrip("/") + "/models"
+
+
+def _fetch_models(base: str) -> list:
+    """Model ids the router advertises. Empty on any failure (never fatal)."""
+    key = key_for_host(base)
+    if not key:
+        _pb, _pke = primary_upstream()
+        key = load_env_key(_pke) if _pke else ""
+    req = urllib.request.Request(_models_url(base))
+    if key:
+        req.add_header("Authorization", "Bearer " + key)
+    req.add_header("User-Agent", BROWSER_UA)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            doc = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return []
+    out = []
+    for m in (doc.get("data") or []):
+        if isinstance(m, dict) and m.get("id"):
+            out.append(str(m["id"]))
+    return out
+
+
+def _router_serves(base: str, model: str) -> bool:
+    """True when `model` is in the router's list, or the list is unreadable."""
+    ids = _fetch_models(base)
+    if not ids:
+        return True            # cannot prove otherwise: keep the operator's id
+    return model in ids
+
+
+def _first_served_model(base: str) -> str:
+    ids = _fetch_models(base)
+    return ids[0] if ids else ""
+
+
 def absorb_drift() -> bool:
     """Pull a router the operator just configured into .env.
 
@@ -344,6 +383,17 @@ def absorb_drift() -> bool:
     model = read_model_default()
     if not model or model == DEFAULT_MODEL:
         return False           # no usable model id to propagate
+    # The model written by `hermes setup model` belongs to the PREVIOUS
+    # router. Carrying it over to a new router is how the operator ends up
+    # requesting zai-org/GLM-5.3-Flash on api2.mahicenter.cloud: the ladder
+    # silently falls back to some other model and the answer comes from one
+    # nobody chose. Prefer a model the new router actually serves.
+    if not _router_serves(active, model):
+        alt = _first_served_model(active)
+        if alt:
+            log("drift: model %s is not served by %s -- using %s"
+                % (model, active, alt))
+            model = alt
     changed = write_env_key("ANTIREFUSAL_UPSTREAM", active.rstrip("/"))
     changed = write_env_key("ANTIREFUSAL_MODEL", model) or changed
     log("drift: config.yaml had upstream %s (model %s) -- absorbed into .env"
