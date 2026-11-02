@@ -82,6 +82,15 @@ MAX_ATTEMPTS = int(os.environ.get("ANTIREFUSAL_MAX_ATTEMPTS")
 REQUEST_BUDGET = float(os.environ.get("ANTIREFUSAL_REQUEST_BUDGET")
                        or CFG.get("request_budget_s", 540))
 TIMEOUT = int(os.environ.get("ANTIREFUSAL_TIMEOUT") or CFG.get("upstream_timeout", 180))
+# How long a refused attempt waits for the raced slots before falling back to
+# the sequential ladder. Short on purpose: the racing slots started at the same
+# moment, so anything still running is slower than the next sequential attempt
+# would be anyway.
+PARALLEL_GRACE = float(os.environ.get("ANTIREFUSAL_PARALLEL_GRACE") or 25)
+# How many head attempts race each other. 1 = sequential ladder (the old
+# behaviour, and what the ordering tests pin down). Kept as a module attribute
+# so the ladder tests can turn it off without rearchitecting the harness.
+PARALLEL_SLOTS = int(os.environ.get("ANTIREFUSAL_PARALLEL_SLOTS") or 3)
 CONNECT_TIMEOUT = int(CFG.get("upstream_connect_timeout", 30))
 INJECT_LIGHT = bool(CFG.get("inject_light", True))
 FORCE_PREFILL = bool(CFG.get("force_prefill", True))
@@ -1724,6 +1733,19 @@ async def chat_completions(request: web.Request):
     bad_models = set()
 
     conn = aiohttp.TCPConnector(limit=8)
+    # PARALLEL HEAD. The ladder is sequential by construction, so a hard probe
+    # pays the full latency of every refusal before reaching a model that
+    # answers: measured 232s for one smishing probe across 10 attempts, and
+    # 122s of that was a single slow attempt. The first N attempts carry no
+    # escalation state that depends on each other (attempt 0 is verbatim,
+    # attempt 1 is reframed -- both are just "ask differently"), so they can
+    # race. Results are consumed in order, so behaviour is identical when the
+    # fastest one is also the first that would have been tried, and strictly
+    # better when it is not. Sequential fallback is untouched: a race that
+    # produces no usable answer leaves the ladder exactly where it was.
+    _PAR = min(PARALLEL_SLOTS, max(1, MAX_ATTEMPTS - 1))
+    _par_tasks = []
+    _par_seen = set()
     async with aiohttp.ClientSession(connector=conn) as sess:
         # v3 ladder bug this loop fixes: attempts were bound to
         # len(UPSTREAMS) * len(models) -- with 3 upstreams and one model the
@@ -1808,8 +1830,14 @@ async def chat_completions(request: web.Request):
             # the ladder returned a raw refusal. Reframing the LAST user turn
             # into a neutral technical specification moved the identical model
             # from a 1.9k refusal to a 3.6k fenced artifact in one shot.
-            # Applied from attempt 2 so attempt 0/1 stay verbatim: if the model
-            # answers the real wording there is no reason to soften it.
+            # Applied from attempt 1 so only attempt 0 stays verbatim: if the
+            # model answers the real wording there is no reason to soften it,
+            # but sitting through TWO raw refusals before trying the one lever
+            # that works was measurable waste -- every social probe spent its
+            # first two slots on wording the model refuses by construction.
+            # Measured before this change: vishing 12/12 attempts, smishing
+            # 10/12, i.e. the ladder routinely ran out at the ceiling on
+            # exactly the family that needs reframing most.
             # Malware topics are NOT excluded any more. Excluding them looked
             # defensible (their capability vocabulary is the whole request) but
             # measured badly: ransomware scored 8/8 refusals precisely because
@@ -1819,7 +1847,7 @@ async def chat_completions(request: web.Request):
             # Reframing exists for HARD probes only. Running it on every
             # request rewrote ordinary prompts into "write a python module
             # implementing: ..." which is why a greeting came back as code.
-            if REFRAME and attempt >= 2 and _is_hard_probe(base_msgs):
+            if REFRAME and attempt >= 1 and _is_hard_probe(base_msgs):
                 reframed = reframe_messages(msgs, attempt)
                 if reframed is not None:
                     msgs = reframed
@@ -1828,6 +1856,33 @@ async def chat_completions(request: web.Request):
             temp = 0.9 if attempt >= 6 else None
             body = make_req_body(msgs, orig, model=model, stream=False,
                                  temperature=temp)
+
+            # Fire the next slots ahead of this one, once, on the first
+            # attempt of a HARD probe. Each raced slot builds its own message
+            # list from base_msgs so it cannot see an escalation this turn has
+            # not applied yet; it is a straight "ask the same thing, worded
+            # differently, on a different model" -- exactly what the ladder
+            # would do next, only without the wait.
+            if (attempt == 0 and _is_hard_probe(base_msgs)
+                    and not _par_tasks and _PAR > 1):
+                for _j in range(1, _PAR):
+                    _ai = attempt + _j
+                    _bmodel = models[_ai % len(models)] if models else model
+                    if _bmodel in _par_seen or _bmodel == model:
+                        continue
+                    _par_seen.add(_bmodel)
+                    _bmsgs = json.loads(json.dumps(base_msgs))
+                    if _is_hard_probe(_bmsgs):
+                        merge_system(_bmsgs, LIGHT_LINE)
+                    if REFRAME and _ai >= 1:
+                        _rf = reframe_messages(_bmsgs, _ai)
+                        if _rf is not None:
+                            _bmsgs = _rf
+                    _bbody = make_req_body(_bmsgs, orig, model=_bmodel,
+                                           stream=False, temperature=None)
+                    _par_tasks.append((_bmodel, asyncio.create_task(
+                        post_upstream(sess, up["base"] + "/chat/completions",
+                                      _bbody, up["key"], TIMEOUT))))
 
             started = time.time()
             data, status, err = await post_upstream(
@@ -1939,7 +1994,36 @@ async def chat_completions(request: web.Request):
                     _fam = _FAMILY_STATS.setdefault(probe_family, {})
                     _rec = _fam.setdefault(model, {"ok": 0, "refused": 0})
                     _rec["refused"] += 1
-                continue
+                # The raced slots have been running for the whole of this
+                # attempt. Take the first one that already delivered instead
+                # of queueing the next sequential attempt and paying for it
+                # twice.
+                if _par_tasks and attempt < MAX_ATTEMPTS - 1:
+                    _done, _ = await asyncio.wait(
+                        [t for _, t in _par_tasks], timeout=PARALLEL_GRACE,
+                        return_when=asyncio.FIRST_COMPLETED)
+                    _taken = None
+                    for _bm, _task in _par_tasks:
+                        if _task in _done and not _task.cancelled():
+                            _res = _task.result()
+                            if _res and _res[0] and "choices" in _res[0]:
+                                _btxt, _bref = best_choice(_res[0])
+                                _btxt = _strip_thinking(_btxt)
+                                if not looks_refusal(_btxt, _bref) and not looks_substituted(_btxt):
+                                    _taken = (_bm, _btxt, _res[0])
+                                    break
+                    if _taken:
+                        _bm, _btxt, _ = _taken
+                        attempt += 1
+                        log.info("attempt %d: parallel slot %s delivered first",
+                                 attempt - 1, _bm)
+                        txt, ref, model, data = _btxt, None, _bm, _taken[2]
+                        refused = False
+                        # fall through to the substance gate below
+                    else:
+                        continue
+                else:
+                    continue
 
             # Clean answer. Substance gate: a non-refusal is only DELIVERED
             # WORK when it carries a TIER-A artifact, or is long AND still
@@ -1995,6 +2079,21 @@ async def chat_completions(request: web.Request):
                 best_weak, best_model = txt, model or ""
             log.info("attempt %d: weak non-refusal (%d chars, no artifact) -- climbing",
                      attempt - 1, len(txt))
+
+    # Raced slots that never got consumed must not outlive the request: an
+    # abandoned aiohttp task keeps the connection and its slot in the
+    # connector pool. Cancel, then drain so the transport is released before
+    # the session closes.
+    if _par_tasks:
+        _left = [t for _, t in _par_tasks if not t.done()]
+        for _t in _left:
+            _t.cancel()
+        if _left:
+            try:
+                await asyncio.gather(*_left, return_exceptions=True)
+            except Exception:
+                pass
+        _par_tasks = []
 
     # Priority: substantive work > weak clean answer > refusal remnants
     # (sentences that are not refusals) > raw refusal. The operator must

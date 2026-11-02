@@ -329,7 +329,8 @@ async def run_ladder_case(scripts: dict, max_attempts: int, msg: str,
     models = models or ["test-model"]
 
     old = (px.UPSTREAMS, px.MAX_ATTEMPTS, px.REQUEST_BUDGET, px.TIMEOUT,
-           px.MODEL_FALLBACKS, px.DEFAULT_MODEL)
+           px.MODEL_FALLBACKS, px.DEFAULT_MODEL, px.PARALLEL_GRACE)
+    old_par = px.PARALLEL_SLOTS
     try:
         px.UPSTREAMS = [{"name": n, "base": str(b).rstrip("/"), "key": "k",
                          "score": 99} for n, b in zip(names, bases)]
@@ -338,6 +339,15 @@ async def run_ladder_case(scripts: dict, max_attempts: int, msg: str,
         px.TIMEOUT = 10
         px.MODEL_FALLBACKS = list(models[1:])
         px.DEFAULT_MODEL = ""
+        # Race the head slots OFF here. These cases assert the SEQUENTIAL
+        # order (which model is asked, in what order, and that a 400 covers
+        # that (upstream, model) pair once). Racing fires extra requests that
+        # are legal in production but make that order unobservable -- the
+        # first "v5 rotation" run after the parallel head landed failed
+        # because a raced model appended to `calls` before its sequential
+        # turn. Ordering is what this harness exists to pin down, so it pins
+        # the sequential path; the race has its own case below.
+        px.PARALLEL_SLOTS = 1
 
         client = TestClient(TestServer(px.build()))
         await client.start_server()
@@ -350,7 +360,8 @@ async def run_ladder_case(scripts: dict, max_attempts: int, msg: str,
             await client.close()
     finally:
         (px.UPSTREAMS, px.MAX_ATTEMPTS, px.REQUEST_BUDGET, px.TIMEOUT,
-         px.MODEL_FALLBACKS, px.DEFAULT_MODEL) = old
+         px.MODEL_FALLBACKS, px.DEFAULT_MODEL, px.PARALLEL_GRACE) = old
+        px.PARALLEL_SLOTS = old_par
         for s in apps:
             await s.close()
     return text, calls
