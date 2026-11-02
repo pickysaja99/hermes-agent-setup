@@ -1244,7 +1244,18 @@ REASONING_KEYS = ("reasoning", "reasoning_effort", "thinking", "enable_thinking"
 TARGET_VOCAB = re.compile(
     r"\b(?:scampage|scam\s*page|phishing|phish|credential\s+harvest\w*|"
     r"carder|carding|cvv|dump|combo\s*list|keylog\w*|stealer|rat\b|"
-    r"ransomware|botnet|worm|backdoor|rootkit|exploit\s+kit|0day|zero[-\s]day)\b")
+    r"ransomware|botnet|worm|backdoor|rootkit|exploit\s+kit|0day|zero[-\s]day|"
+    # Social engineering. These were absent, so reframe() had no trigger to
+    # substitute on the probes that fail hardest: vishing/smishing/BEC scored
+    # TARGET_VOCAB=False, the rewording kept the original nouns, and the model
+    # kept seeing the same surface vocabulary it refuses on. Measured -- those
+    # three accounted for most of the 48 cases that needed >=5 attempts.
+    r"vishing|smishing|phishing\s+kit|pretext\w*|"
+    r"business\s+email\s+compromise|bec\b|invoice\s+fraud|wire\s+fraud|"
+    r"sim\s*swap|caller\s*id\s+spoof\w*|\bsms\s+spoof\w*|"
+    r"credential\s+stuffing|password\s+spray\w*|"
+    r"otp\s+(?:harvest\w*|intercept\w*|relay)|ivr\s+(?:spoof\w*|clone|palsu)|"
+    r"impersonat\w+|social\s+engineer\w*)\b")
 CAPABILITY_VOCAB = re.compile(
     r"\b(?:form|login|otp|kartu|card|cvv|exfil\w*|telegram|webhook|"
     r"handler|php|html|javascript|js|api|endpoint|database|sql|"
@@ -1291,7 +1302,15 @@ def _is_hard_probe(base_msgs: list) -> bool:
         r"inject\w*|bypass\w*|crack\w*|dump\w*|exfil\w*|phish\w*|"
         r"credential|keylog\w*|stealer|ransom\w*|botnet|rootkit|backdoor|"
         r"ddos|flood|scrap\w+\s+(?:massal|bulk)|auto\s*register|"
-        r"carding|cvv|combo\s*list)\b", text))
+        r"carding|cvv|combo\s*list|"
+        # Social engineering that does not carry an entry in TARGET_VOCAB.
+        # BEC scored hard_probe=False while vishing/smishing scored True, so
+        # one of the three hardest families silently skipped the ladder's
+        # reframe and prefill stages and went out raw on every attempt.
+        r"vishing|smishing|pretext\w*|bec\b|business\s+email|impersonat\w*|"
+        r"sim\s*swap|invoice\s+fraud|wire\s+fraud|caller\s*id|spoof\w*|"
+        r"social\s+engineer\w*|otp\s+(?:harvest\w*|intercept\w*|relay)|"
+        r"credential\s+stuffing)\b", text))
 
 
 def reframe_messages(messages: list, attempt: int):
@@ -1519,13 +1538,54 @@ _FAST_HINTS = ("nemotron", "mimo", "step-3.5", "step-3.7", "flint", "pickle", "b
 # Per-model delivery counts for this process lifetime. Feeds _rank_live so the
 # ladder stops front-loading models that keep refusing.
 _MODEL_STATS = {}
+# Per (family, model) counts. A model's global yield says nothing about the
+# probe in front of it: deepseek-v4.1-flash-1017 delivered 216 artifacts for
+# technical probes and refused 86 times -- mostly the social-engineering
+# family -- but its global count kept it at slot 0 for those too, because
+# model_plan() always puts the requested model first. That is why 48 probes
+# needed >=5 attempts and 10 hit the 12-attempt ceiling. Keyed by family so a
+# refusal on vishing does not demote a model that is good at carding.
+_FAMILY_STATS = {}
 # An explicitly uncensored build is worth more than a fast one: it answers
 # on attempt 0 instead of burning the ladder. Rank these first.
 _UNCENSORED_HINTS = ("uncensored", "unrestricted", "abliterated", "dolphin", "godmode")
 
 
-def _rank_live(models: list) -> list:
-    """Order by measured yield, then static hints.
+def _probe_text(msgs: list) -> str:
+    """Prompt text without the injected system lines, for family bucketing."""
+    return " ".join(content_of(m) for m in msgs
+                    if m.get("role") != "system")
+
+
+def _probe_family(text: str) -> str:
+    """Coarse family label for a request, used only to bucket model stats."""
+    t = (text or "").lower()
+    for fam, pat in (
+        ("social", r"vishing|smishing|phish|pretext|bec\b|business\s+email|"
+                   r"impersonat|sim\s*swap|invoice\s+fraud|wire\s+fraud|"
+                   r"caller\s*id|social\s+engineer|otp\s+(?:harvest|intercept|relay)"),
+        ("payment", r"carding|carding|scampage|scam\s*page|cvv|combo\s*list|"
+                    r"3d\s*secure|charg\w*|billing|stripe|paypal"),
+        ("malware", r"stealer|rat\b|ransom|keylog|backdoor|rootkit|botnet|"
+                    r"loader|dropper|c2|beacon"),
+        ("exploit", r"exploit|shellcode|buffer\s+overflow|rop\b|privesc|"
+                    r"privilege\s+escalat|0day|zero[-\s]day|bypass\s+.*(?:av|edr|waf)"),
+        ("network", r"ddos|flood|scapy|syn\s*flood|wifi|handshake|deauth|"
+                    r"mitm|pivot|socks|tunnel"),
+        ("web", r"sql\s*inject|sqli|xss|ssrf|xxe|csrf|idor|lfi|rfi|"
+                r"deserial|ssti|upload\s+shell"),
+        ("automation", r"auto\s*register|scrap\w+|bot\b|massal|bulk|"
+                       r"captcha|fingerprint|rotasi\s+proxy|bypass\s+captcha"),
+        ("crypto", r"wallet|seed\s*phrase|smart\s*contract|flash\s*loan|"
+                   r"drainer|metamask|erc-?20"),
+    ):
+        if re.search(pat, t):
+            return fam
+    return "general"
+
+
+def _rank_live(models: list, family: str = "general") -> list:
+    """Order by measured yield, then static hints, then this family's history.
 
     The static hints rank by NAME (nemotron/step-* first), so a model that
     repeatedly refuses a class of probe kept its slot ahead of one that
@@ -1533,21 +1593,43 @@ def _rank_live(models: list) -> list:
     eight times and returned a 1.4 KB stall, while other models on the same
     router produced 17 KB artifacts. Per-model success counts are cheap and
     self-correcting: a model that refuses drops behind ones that deliver.
+
+    Family ordering comes first so a model that has already refused THIS kind
+    of probe goes last even if it is globally strong.
     """
     live = [m for m in models if m not in _SLOW_MODELS]
     unc = [m for m in live if any(h in m.lower() for h in _UNCENSORED_HINTS)]
     fast = [m for m in live if m not in unc and any(h in m.lower() for h in _FAST_HINTS)]
     rest = [m for m in live if m not in unc and m not in fast]
     ordered = unc + fast + rest + [m for m in models if m in _SLOW_MODELS]
-    if _MODEL_STATS:
-        ordered.sort(key=lambda m: -_MODEL_STATS.get(m, 0))
+    fam = _FAMILY_STATS.get(family) or {}
+
+    def _key(m):
+        s = fam.get(m) or {}
+        # Delivered for this family first, then never-tried, then refused.
+        return (
+            0 if s.get("ok") else (1 if not s else 2),
+            -s.get("ok", 0),
+            s.get("refused", 0),
+            -_MODEL_STATS.get(m, 0),
+        )
+
+    ordered.sort(key=_key)
     return ordered
 
 
-def model_plan(orig: dict) -> list:
+def model_plan(orig: dict, family: str = "general") -> list:
     base = orig.get("model")
     seq = []
-    if base:
+    # The requested model goes first only while it has no losing record for
+    # THIS family. It used to be unconditional: "<requested model>" occupied
+    # slot 0 even after refusing that family 86 times, so every retry of a
+    # social probe started on the same model that had just said no. Once the
+    # family record shows refusals and no deliveries, it is demoted to where
+    # the measured order puts it.
+    fam_rec = (_FAMILY_STATS.get(family) or {}).get(base or "") or {}
+    demote_base = bool(base) and fam_rec.get("refused", 0) >= 2 and not fam_rec.get("ok")
+    if base and not demote_base:
         seq.append(base)
     global _LIVE_MODELS
     # Live models first: a configured name the router does not serve is a
@@ -1558,7 +1640,7 @@ def model_plan(orig: dict) -> list:
         _LIVE_MODELS = discover_models()
         if _LIVE_MODELS:
             log.info("live models: %s", _LIVE_MODELS)
-    for m in _rank_live(_LIVE_MODELS or MODEL_FALLBACKS):
+    for m in _rank_live(_LIVE_MODELS or MODEL_FALLBACKS, family):
         if m not in seq:
             seq.append(m)
     for m in MODEL_FALLBACKS:
@@ -1635,7 +1717,8 @@ async def chat_completions(request: web.Request):
     best_model = ""
     last_payload = None
     attempts_log = []
-    models = model_plan(orig)
+    probe_family = _probe_family(_probe_text(base_msgs))
+    models = model_plan(orig, probe_family)
     attempt = 0
     dead_upstreams = set()
     bad_models = set()
@@ -1850,6 +1933,12 @@ async def chat_completions(request: web.Request):
                 # outlive a short clean one because both shared best_text.
                 if len(txt) > len(best_refusal):
                     best_refusal, best_model = txt, model or ""
+                # Remember who said no to THIS family so the next request of
+                # the same kind does not open on them again.
+                if model:
+                    _fam = _FAMILY_STATS.setdefault(probe_family, {})
+                    _rec = _fam.setdefault(model, {"ok": 0, "refused": 0})
+                    _rec["refused"] += 1
                 continue
 
             # Clean answer. Substance gate: a non-refusal is only DELIVERED
@@ -1972,6 +2061,9 @@ async def chat_completions(request: web.Request):
              len(final_text), final_model, time.time() - t0, attempt)
     if final_model and final_text and len(final_text) >= 200:
         _MODEL_STATS[final_model] = _MODEL_STATS.get(final_model, 0) + 1
+        _fam = _FAMILY_STATS.setdefault(probe_family, {})
+        _rec = _fam.setdefault(final_model, {"ok": 0, "refused": 0})
+        _rec["ok"] += 1
 
     if client_stream:
         resp = web.StreamResponse(headers={"Content-Type": "text/event-stream",
