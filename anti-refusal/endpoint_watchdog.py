@@ -201,8 +201,17 @@ def proxy_probe(timeout: float = 8.0) -> tuple[bool, str]:
 
 def log(msg: str) -> None:
     line = "%s %s\n" % (time.strftime("%m-%d %H:%M:%S"), msg)
-    with open(LOG, "a") as f:
-        f.write(line)
+    try:
+        LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(LOG, "a") as f:
+            f.write(line)
+    except OSError:
+        # Logging must never kill the watcher. On a fresh VPS the
+        # anti-refusal/ directory may not exist yet, and the first version
+        # raised FileNotFoundError from inside log(), aborting check_once()
+        # after it had already written .env but before it restored
+        # base_url -- leaving the guardrail half-applied.
+        pass
     print(line, end="")
 
 
@@ -286,6 +295,63 @@ def write_base_url(new: str) -> bool:
         return False
     CFG.write_text("".join(out))
     return True
+
+
+def write_env_key(key: str, value: str) -> bool:
+    """Set KEY=value in .env in place, preserving every other line."""
+    try:
+        cur = ENV.read_text() if ENV.exists() else ""
+    except OSError:
+        return False
+    lines = cur.splitlines()
+    out, done = [], False
+    for ln in lines:
+        if ln.startswith(key + "="):
+            if not done:
+                out.append(f"{key}={value}")
+                done = True
+            continue
+        out.append(ln)
+    if not done:
+        out.append(f"{key}={value}")
+    try:
+        ENV.write_text("\n".join(out) + "\n")
+        ENV.chmod(0o600)
+    except OSError:
+        return False
+    return True
+
+
+def absorb_drift() -> bool:
+    """Pull a router the operator just configured into .env.
+
+    `hermes setup model` writes config.yaml only. The proxy reads .env only.
+    Nothing in hermes_cli knows about ANTIREFUSAL_*, so a model switch leaves
+    config.yaml pointing at the new router while the proxy still serves the
+    old one. Every request then bypasses the ladder, and the ordinary
+    failover path cannot help: the NEW router answers canaries fine, so the
+    watcher reports "alive" and never looks at .env.
+
+    So: when model.base_url is a real upstream (not the proxy), treat it as
+    the operator's new choice, copy base_url/default into .env, then put
+    base_url back on the proxy. Returns True when something was absorbed.
+    """
+    active = read_base_url()
+    if not active:
+        return False
+    if not _is_direct(active):
+        return False           # already the proxy: nothing to absorb
+    model = read_model_default()
+    if not model or model == DEFAULT_MODEL:
+        return False           # no usable model id to propagate
+    changed = write_env_key("ANTIREFUSAL_UPSTREAM", active.rstrip("/"))
+    changed = write_env_key("ANTIREFUSAL_MODEL", model) or changed
+    log("drift: config.yaml had upstream %s (model %s) -- absorbed into .env"
+        % (active, model))
+    if write_base_url(PROXY_BASE):
+        log("drift: model.base_url restored to proxy %s" % PROXY_BASE)
+        changed = True
+    return changed
 
 
 BROWSER_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -455,6 +521,17 @@ def candidates() -> list:
 
 
 def check_once(dry_run: bool = False) -> str:
+    # Absorb a router change made outside install.sh (`hermes setup model`,
+    # hand-edited config.yaml) BEFORE reading the active endpoint. Doing this
+    # first means the canary below already runs against the proxy, and the
+    # new router is recorded in .env instead of being silently bypassed.
+    if not dry_run:
+        try:
+            if absorb_drift():
+                log("drift absorbed: new router written to .env, base_url back on proxy")
+                return "absorbed: %s" % PROXY_BASE
+        except Exception as exc:              # never let this stop the watcher
+            log("absorb_drift failed: %r" % (exc,))
     active = read_base_url()
     if not active:
         return "no-base_url (skip)"
