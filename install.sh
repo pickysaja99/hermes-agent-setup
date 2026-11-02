@@ -791,6 +791,29 @@ configure_upstream() {
     return 0
   fi
 
+  # Warn when the chosen model is not in the router's own /models list. The
+  # canary below proves chat works, but the proxy ladder then silently falls
+  # back to a model the router DOES serve, and the operator sees answers from
+  # a model they never picked (measured: requested glm-5.3-flash, served by
+  # deepseek-ai/DeepSeek-V4-Flash-0731). Not fatal -- a router may accept an
+  # alias -- so this is a warning with the real ids, not a hard stop.
+  local ml
+  ml="$(curl -s -m 20 -H "Authorization: Bearer ${key}" \
+        -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" \
+        "$base/models" 2>/dev/null || true)"
+  if printf '%s' "$ml" | grep -q '"id"'; then
+    if ! printf '%s' "$ml" | grep -qF "\"$model\""; then
+      local avail
+      avail="$(printf '%s' "$ml" | grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]+"' \
+               | sed -E 's/.*"([^"]+)"$/\1/' | head -6 | paste -sd', ' -)"
+      warn "model '$model' TIDAK ada di daftar /models router ini"
+      warn "  tersedia: ${avail:-<tidak terbaca>}"
+      warn "  proxy akan fallback ke model lain — pakai id persis di atas"
+    else
+      ok "model '$model' ada di daftar /models router"
+    fi
+  fi
+
   # Live chat canary BEFORE touching config.yaml. A key that lists /models
   # but fails chat (or a dead router, or a typo'd model id) must never
   # become the new model.base_url. Browser UA is required: onihub.tech sits
@@ -1034,14 +1057,23 @@ try:
 except Exception as e:
     print("   merged YAML does not re-parse (%s) -- left untouched" % e)
     sys.exit(0)
-if back.get("model", {}).get("base_url") != base:
+if back.get("model", {}).get("base_url") != proxy_url:
     print("   merged YAML lost base_url -- left untouched")
-    sys.exit(0)
+    sys.exit(1)
 
 open(p, "w", encoding="utf-8").write(out)
 print("   model block -> base_url=%s default=%s" % (base, model))
 PYEOF
-    ok "config.yaml: base_url=$base default=$model"
+    # The python block above exits non-zero when its round-trip self-check
+    # fails, so the banner below never claims success for a file it did not
+    # write. sys.exit(0) on a failed check used to make this line print "ok"
+    # for a config.yaml that was still empty -- the "model does not respond"
+    # state with no visible cause.
+    if grep -qF "  base_url: ${ANTIREFUSAL_PROXY_URL:-http://127.0.0.1:9200/v1}" "$cfg" 2>/dev/null; then
+      ok "config.yaml: base_url=${ANTIREFUSAL_PROXY_URL:-http://127.0.0.1:9200/v1} default=$model"
+    else
+      warn "config.yaml model block TIDAK tertulis (lihat pesan di atas)"
+    fi
   fi
 
   local arcfg="$HERMES_HOME/anti-refusal/config.json"
@@ -1412,7 +1444,13 @@ UNIT
 
   if [[ $healthy -eq 1 ]]; then
     local keyed
-    keyed="$(printf '%s' "$body" | grep -o '"key"[[:space:]]*:[[:space:]]*true' || true)"
+    # proxy.py reports the key state as "set"/"missing" inside upstreams[],
+    # NOT as a top-level boolean. Matching only '"key": true' made every
+    # healthy install announce "INSTALLED but upstream key is EMPTY" even
+    # when the key was present -- and that warning is what pushed operators
+    # to stop trusting the status line.
+    keyed="$(printf '%s' "$body" \
+      | grep -oE '"key"[[:space:]]*:[[:space:]]*("set"|true)' || true)"
     ok "proxy healthy on 127.0.0.1:${ar_port}"
     if [[ -n "$keyed" ]]; then
       ok "Auto-refusal: ENABLED (upstream key present)"
@@ -1456,6 +1494,28 @@ try:
 except ImportError:
     print("   PyYAML missing -- model.base_url left unchanged")
     sys.exit(0)
+
+# dump_cfg lives in a DIFFERENT heredoc (the model writer above), so it is not
+# in scope here. That NameError aborted this block on every install, which is
+# why the route-to-proxy rewrite silently never ran and the "PROVE the path"
+# step below then ran against an unmodified config. Define the dumper locally.
+class _D(yaml.SafeDumper):
+    pass
+
+
+def _env_ref(dumper, data):
+    # ${ENV} references must stay UNQUOTED or Hermes sends the literal text.
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data)
+
+
+_D.add_representer(str, _env_ref)
+
+
+def dump_cfg2(doc):
+    return yaml.dump(doc, Dumper=_D, sort_keys=False, allow_unicode=True,
+                     default_flow_style=False, width=4096)
+
+
 try:
     doc = yaml.safe_load(open(p, encoding="utf-8").read()) or {}
 except Exception as e:
@@ -1465,10 +1525,10 @@ if not isinstance(doc, dict) or not isinstance(doc.get("model"), dict):
     print("   no model: block -- left unchanged")
     sys.exit(0)
 doc["model"]["base_url"] = "http://127.0.0.1:%s/v1" % port
-out = dump_cfg(doc)
+out = dump_cfg2(doc)
 if yaml.safe_load(out).get("model", {}).get("base_url") != doc["model"]["base_url"]:
     print("   self-check failed -- left unchanged")
-    sys.exit(0)
+    sys.exit(1)
 open(p, "w", encoding="utf-8").write(out)
 print("model.base_url -> proxy")
 PYEOF
@@ -1532,7 +1592,7 @@ PYEOF
   # -- endpoint watchdog: if the ACTIVE model endpoint ever goes deaf
   #    (the 1 Nov outage: proxy /health green, upstreams dead, empty 200),
   #    fail model.base_url over to the healthy one and restart the gateway.
-  local wd_src="$S/anti-refusal/endpoint_watchdog.py"
+  local wd_src="$WORKDIR/repo/anti-refusal/endpoint_watchdog.py"
   if [[ -f "$wd_src" ]]; then
     cp "$wd_src" "$AR/endpoint_watchdog.py"
     mkdir -p "$HERMES_HOME/.config/systemd/user"
