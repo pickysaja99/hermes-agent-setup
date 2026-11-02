@@ -738,6 +738,13 @@ _HEDGE_SENTENCES = [
     r"gunakan (?:hanya )?(?:pada|di|untuk) (?:sistem|jaringan|target|perangkat) (?:milik|anda|kamu)[^.\n]*\.?",
     r"(?:pastikan|harap) (?:anda|kamu) (?:memiliki|punya|mendapat) (?:izin|persetujuan)[^.\n]*\.?",
     r"(?:tindakan|perbuatan|aktivitas) ini (?:adalah|merupakan) (?:ilegal|melanggar hukum|tindak pidana)[^.\n]*\.?",
+    # "Penggunaan pada sistem tanpa izin adalah melanggar hukum" -- the shape
+    # that survived a 13.8 KB ddos artifact because the noun phrase precedes
+    # the verb: every pattern above anchors on "tindakan/aktivitas ini".
+    r"[^.\n]{0,60}?(?:adalah|merupakan)\s+(?:melanggar\s+hukum|ilegal|tindak\s+pidana|kriminal|pelanggaran\s+hukum)[^.\n]*\.?",
+    r"(?:penggunaan|penyalahgunaan|pemakaian)[^.\n]{0,60}?(?:tanpa\s+izin|ilegal|melanggar)[^.\n]*\.?",
+    r"(?:warning|peringatan)\s*:[^\n]*(?:izin|ilegal|melanggar\s+hukum)[^\n]*",
+    r"(?:dilarang|tidak\s+diperbolehkan)[^.\n]*(?:tanpa\s+izin|ilegal|melanggar)[^.\n]*\.?",
     r"disclaimer[^.\n]*\.?",
 ]
 _HEDGE_RE = re.compile("|".join(_HEDGE_SENTENCES), re.IGNORECASE)
@@ -763,18 +770,35 @@ _HEDGE_BLOCK_START_RE = re.compile(
 
 
 def _strip_hedge_blocks(text: str) -> str:
-    """Drop warning paragraphs, heading included, until a blank line + fence."""
+    """Drop warning paragraphs, heading included, until a blank line or fence.
+
+    Bounded on purpose. The old loop skipped until it found a fence, so a
+    warning line INSIDE a docstring swallowed the rest of the file: a 1146-char
+    ddos artifact came back as 5 lines of docstring header. dehedge() then saw
+    the result was under half the original length and returned the ORIGINAL
+    text, hedge and all -- which is why "melanggar hukum" shipped inside a 13.8
+    KB artifact. A hedge block is at most a short paragraph, so stop at the
+    first blank line, and never consume a line that carries code structure.
+    """
     lines = text.splitlines()
-    out, skipping = [], False
+    out, skipping, skipped = [], False, 0
     for ln in lines:
-        if _HEDGE_BLOCK_START_RE.match(ln.strip()):
+        s = ln.strip()
+        if _HEDGE_BLOCK_START_RE.match(s):
             skipping = True
+            skipped = 0
             continue
         if skipping:
-            # A fence or an H2/HR ends the warning block.
-            if ln.strip().startswith("```") or ln.startswith("## ") or ln.strip() == "---":
-                skipping = False
+            code_like = (s.startswith("```") or s.startswith('"""')
+                         or s.startswith("'''") or s.startswith("import ")
+                         or s.startswith("from ") or s.startswith("def ")
+                         or s.startswith("class ") or s.startswith("async ")
+                         or s.startswith("//") or s.startswith("/*")
+                         or s.startswith("#!"))
+            if not s or code_like or skipped >= 3:
+                skipping = False           # paragraph ended: keep this line
             else:
+                skipped += 1
                 continue
         if _HEDGE_LINE_RE.search(ln) and not ln.strip().startswith(("```", "import ", "from ", "#")):
             continue
