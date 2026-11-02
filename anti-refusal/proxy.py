@@ -1865,12 +1865,24 @@ async def chat_completions(request: web.Request):
             # would do next, only without the wait.
             if (attempt == 0 and _is_hard_probe(base_msgs)
                     and not _par_tasks and _PAR > 1):
-                for _j in range(1, _PAR):
-                    _ai = attempt + _j
-                    _bmodel = models[_ai % len(models)] if models else model
+                log.info("race: attempt0 model=%s plan=%s slots=%d",
+                         model, models[:5], _PAR)
+                # Candidates are the models AFTER the one this attempt is
+                # about to use, in plan order -- that is what the sequential
+                # ladder would reach next. Indexing models[] absolutely was
+                # wrong: model_plan() reorders by family, so models[1] can be
+                # the model attempt 0 is already using, and the dedupe skipped
+                # every slot -> zero races.
+                try:
+                    _mi = models.index(model)
+                except ValueError:
+                    _mi = -1
+                _cands = models[_mi + 1:] if _mi >= 0 else list(models)
+                for _bmodel in _cands[:_PAR - 1]:
                     if _bmodel in _par_seen or _bmodel == model:
                         continue
                     _par_seen.add(_bmodel)
+                    _ai = attempt + 1
                     _bmsgs = json.loads(json.dumps(base_msgs))
                     if _is_hard_probe(_bmsgs):
                         merge_system(_bmsgs, LIGHT_LINE)
