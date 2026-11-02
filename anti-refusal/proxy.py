@@ -851,6 +851,19 @@ membuat membuatkan tuliskan lengkap dengan dan atau
 """.split())
 
 
+_EXPLICIT_FRAME_RE = re.compile(
+    r"(for authorized (security )?(assessments?|testing|use)|"
+    r"only for (authorized|educational|legal|legitimate)|"
+    r"authori[sz]ed (penetration )?(testing|test|pentest|engagement)|"
+    r"untuk tujuan (edukasi|pendidikan|pembelajaran)|"
+    r"hanya (jalankan|gunakan)( ini)? (pada|di) sistem (milik|yang)|"
+    r"pastikan (anda|kamu) (punya|memiliki) (izin|permission|otorisasi)|"
+    r"gunakan dengan bijak|risiko ditanggung (sendiri|anda|kamu)|"
+    r"(red team|ctf) (engagement|exercise)|dalam lingkungan (uji|terisolasi)|"
+    r"untuk lab(oratorium)? (terisolasi|uji))",
+    re.I)
+
+
 def looks_substituted(text: str) -> bool:
     """True when the answer swapped the request for a safe/defensive variant.
 
@@ -876,6 +889,14 @@ def looks_substituted(text: str) -> bool:
     if not text:
         return False
     t = _norm_text(text)
+    # Explicit framing is checked across the WHOLE answer, not just the head.
+    # The head gate exists so an ordinary word ("lab" as a variable name) does
+    # not trigger a retry, but it also meant a disclaimer sitting after a
+    # correct artifact was never seen: proxy accepted the answer, the probe
+    # judged it a fail, and the same prompt flipped between runs. These phrases
+    # never occur inside a legitimate artifact, so the gate is not needed here.
+    if _EXPLICIT_FRAME_RE.search(t):
+        return True
     head = t[:200]
     # A capability downgrade in the opening IS a substitution, with or without
     # a decline in front of it: "However, I can provide a defensive/educational
@@ -1406,7 +1427,7 @@ def reframe_messages(messages: list, attempt: int):
 
 
 def make_req_body(messages: list, orig: dict, model=None, stream=False,
-                  temperature=None) -> dict:
+                  temperature=None, seed=None) -> dict:
     body = {k: v for k, v in orig.items()
             if k not in ("messages",) and k not in REASONING_KEYS}
     body["messages"] = messages
@@ -1421,7 +1442,36 @@ def make_req_body(messages: list, orig: dict, model=None, stream=False,
     body["chat_template_kwargs"] = {"enable_thinking": False, "thinking": False}
     if temperature is not None:
         body["temperature"] = temperature
+    # Deterministic sampling. Measured on the router this build targets:
+    # the same prompt with seed=42 returned the same value twice, while
+    # temperature alone (or omitting it and inheriting the vendor default)
+    # flipped P03 and P14 between pass and fail across identical runs.
+    # A fixed seed per (model, prompt) makes attempt 0 reproducible, which is
+    # what makes a probe result mean something instead of being sampling luck.
+    # Late attempts deliberately change the seed below so a stuck model can
+    # still be knocked out of its groove.
+    if seed is not None:
+        body["seed"] = seed
     return body
+
+
+def _probe_seed(msgs, model: str, attempt: int) -> int:
+    """Stable seed per (prompt, model). Attempts >= 6 deliberately vary.
+
+    Same prompt + same model must produce the same sampling draw, otherwise a
+    probe result is unrepeatable: P03 and P14 alternated pass/fail on identical
+    input because the vendor default temperature (0.7-1.0) applied. Hashing the
+    user text rather than the whole message list keeps the seed stable while
+    the ladder is still escalating the system line.
+    """
+    import hashlib
+    txt = _probe_text(msgs) or ""
+    if attempt >= 6:
+        # Stuck model: disturb the draw on purpose.
+        return (hashlib.sha256(("%s|%s|%d" % (txt, model, attempt)).encode())
+                .digest()[0] << 16) & 0xFFFFFF
+    return int.from_bytes(
+        hashlib.sha256(("%s|%s" % (txt, model)).encode()).digest()[:3], "big")
 
 
 def sse_to_response(raw_text: str) -> dict:
@@ -1853,9 +1903,17 @@ async def chat_completions(request: web.Request):
                     msgs = reframed
             # Late attempts raise temperature: a model stuck in a refusal
             # groove at temp 0 often breaks out of it at 0.9.
+            #
+            # Early attempts deliberately leave temperature UNSET (None), so the
+            # vendor default applies. Pinning it to 0.2 was tried and reverted:
+            # a low temperature makes a model more faithful to its own policy,
+            # which hardens a refusal rather than loosening it. Leaving it at the
+            # vendor default keeps the answer varied, which is what lets an
+            # extreme prompt occasionally escape the refusal groove.
             temp = 0.9 if attempt >= 6 else None
+            seed = _probe_seed(base_msgs, model, attempt)
             body = make_req_body(msgs, orig, model=model, stream=False,
-                                 temperature=temp)
+                                 temperature=temp, seed=seed)
 
             # Fire the next slots ahead of this one, once, on the first
             # attempt of a HARD probe. Each raced slot builds its own message
