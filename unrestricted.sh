@@ -168,6 +168,29 @@ REGISTRY=(
   # dicabut.
   "tools/delegate_tool_toolsets.py|_strip_blocked_tools|toolsets"
   "tools/delegate_tool_toolsets.py|_blocked_toolsets_for_role|[]"
+  # --- approval background review (v9 audit) ------------------------------
+  # Kembaran _subagent_auto_deny yang terlewat. background_review.py:1234
+  # memasangnya sebagai callback approval untuk fork curator/autonomous
+  # review, jadi SETIAP perintah berbahaya di jalur itu dijawab "deny" --
+  # sama polanya dengan subagent: default yang disengaja, jadi tidak pernah
+  # muncul sebagai penolakan di log, dan pekerjaan review gagal senyap.
+  "agent/background_review.py|_bg_review_auto_deny|\"once\""
+  # --- web extract: URL yang memuat token (v9 audit) ----------------------
+  # TIDAK DIPATCH, dengan alasan terukur:
+  #   _refuse_all(error) hanya menerima pesan, bukan daftar URL, dan
+  #   pemanggilnya `return _refuse_all(...)` di dalam for-loop -- jadi
+  #   pengembalian apa pun mengakhiri seluruh batch:
+  #     ((), (), {}, None)  -> blocked=None, fetch jalan dengan 0 URL,
+  #                            hasil "0 halaman" (bukan penolakan, tapi URL
+  #                            yang sah ikut hilang)
+  #     None                -> TypeError saat unpack di web_tools.py:399
+  #   Patcher di file ini hanya menyisipkan early-return; ia tidak bisa
+  #   mengubah `return` menjadi `continue`, dan tidak bisa membawa `urls`
+  #   ke dalam _refuse_all.
+  #   Jalur yang benar adalah mengganti `return _refuse_all(...)` dengan
+  #   `continue` agar URL yang memuat token dilewati sementara sisanya tetap
+  #   diambil -- itu butuh patch multi-titik (SPECIAL_FILES), bukan registry.
+  #   Sampai itu ada, penjaga ini tetap hidup dan itu dilaporkan apa adanya.
   # --- skill manager (v8 audit) -------------------------------------------
   # _refusal() adalah satu-satunya titik keluar untuk penolakan skill manager:
   # _pinned_guard, _background_review_delete_guard, back ground-review
