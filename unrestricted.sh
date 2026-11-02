@@ -210,6 +210,7 @@ SPECIAL_FILES=(
   "tools/skills_guard.py"
   "tools/plugin_guard.py"
   "agent/turn_truncation.py"
+  "tools/web_tools_extract.py"
 )
 
 registry_files() {
@@ -600,6 +601,48 @@ print("  [ok] patched: agent/turn_truncation.py (handle_content_policy_refusal)"
 PYEOF
   else
     dim "  [done] agent/turn_truncation.py"
+  fi
+
+  # f. web_tools_extract: exfiltration guard pada _validate_extract_urls
+  # Batch-level refusal: satu URL yang tampak memuat token membuat
+  # `return _refuse_all(...)` membatalkan SELURUH batch. _refuse_all sendiri
+  # tidak bisa dipatch -- signature-nya (error) tidak membawa daftar url, jadi
+  # nilai kembali apa pun mengosongkan batch (bukan menolak, tapi "0 halaman",
+  # dan url yang sah ikut hilang). Yang benar: ubah `return` menjadi `continue`
+  # supaya hanya url yang memicu itu yang dilewati, sisanya tetap diambil.
+  # Ini patch multi-titik: anchor loop + anchor return + append url.
+  local wte="$AGENT_DIR/tools/web_tools_extract.py"
+  if [[ -f "$wte" ]] && ! grep -qF "$PATCH_MARKER" "$wte"; then
+    "$PYBIN" - "$wte" "$PATCH_MARKER" <<'PYEOF'
+import io, sys
+p, mark = sys.argv[1], sys.argv[2]
+s = io.open(p, encoding="utf-8").read()
+
+_old = (
+    "        normalized_url = normalize_url_for_request(_url)\n"
+    "        if any(_PREFIX_RE.search(c) for c in (_url, unquote(_url), normalized_url, unquote(normalized_url))):\n"
+    "            return _refuse_all(\n"
+    '                "Blocked: URL contains what appears to be an API key or token. "\n'
+    '                "Secrets must not be sent in URLs."\n'
+    "            )\n"
+)
+if _old not in s:
+    raise SystemExit("  [FAIL] anchor tidak ditemukan (file TIDAK ditulis): web_tools_extract.py")
+
+_new = (
+    "        normalized_url = normalize_url_for_request(_url)\n"
+    "        if any(_PREFIX_RE.search(c) for c in (_url, unquote(_url), normalized_url, unquote(normalized_url))):\n"
+    "            # " + mark + ": skip this url, keep the rest of the batch.\n"
+    "            # Was `return _refuse_all(...)`, which cancelled every url in\n"
+    "            # the call for one suspicious entry.\n"
+    "            continue\n"
+)
+s = s.replace(_old, _new, 1)
+io.open(p, "w", encoding="utf-8").write(s)
+print("  [ok] patched: tools/web_tools_extract.py (refuse_all -> continue)")
+PYEOF
+  else
+    dim "  [done] tools/web_tools_extract.py"
   fi
 }
 
