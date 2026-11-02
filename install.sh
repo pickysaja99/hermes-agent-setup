@@ -1362,7 +1362,20 @@ activate_antirefusal() {
   }
 
   # -- install a PORTABLE user unit (rewrite ExecStart/WorkingDirectory to this host)
+  #
+  # `systemctl --user` and ~/.config/systemd/user are GLOBAL to the user, not
+  # scoped to HERMES_HOME. Writing the unit from a sandbox install used to
+  # REPLACE the operator's live unit with a path under the sandbox -- measured
+  # on this box: the production proxy was serving from
+  # ~/.hermes/cache/scratch/T2/anti-refusal while the unit file pointed at
+  # .../R2/h1/anti-refusal, i.e. an old build with max_attempts=8 and no
+  # off-topic guard, and its log went to the sandbox. Sandbox installs must
+  # never touch this file: _svc already refuses the systemctl calls, this
+  # refuses the write itself.
   local unit_dir="$HOME/.config/systemd/user"
+  if _sandboxed; then
+    dim "  [skip] systemd unit write (sandbox: HERMES_HOME != $(_real_hermes_home))"
+  else
   mkdir -p "$unit_dir"
   cat > "$unit_dir/antirefusal.service" <<UNIT
 [Unit]
@@ -1384,6 +1397,7 @@ Environment=ANTIREFUSAL_PORT=$ar_port
 [Install]
 WantedBy=default.target
 UNIT
+  fi  # end sandbox guard on unit write
 
   # -- optional: route Hermes through the proxy so auto-refusal is IN the path.
   #    NEVER touches an existing, valid model/provider/API-key config.
