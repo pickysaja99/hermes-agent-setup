@@ -727,6 +727,18 @@ configure_upstream() {
   # operator never chose (and had no key for). Empty = ask the operator.
 
   local base="${SETUP_BASE_URL:-}" key="${SETUP_API_KEY:-}" model="${SETUP_MODEL:-}" models=""
+  # Non-TTY with no SETUP_* env: keep what the box already has instead of
+  # aborting. A re-install on a configured machine previously printed
+  # "API key kosong -- config tidak diubah" and returned BEFORE routing
+  # model.base_url to the proxy, so the operator ended up with a working
+  # config but no guardrail -- the exact silent-drift §0b warns about.
+  # cur_key/cur_base/cur_model were already parsed above and were only ever
+  # used by the interactive prompt.
+  if [[ $have_tty -eq 0 ]]; then
+    [[ -z "$base"  && -n "$def_base"  ]] && base="$def_base"
+    [[ -z "$key"   && -n "$cur_key"   ]] && key="$cur_key"
+    [[ -z "$model" && -n "$cur_model" ]] && model="$cur_model"
+  fi
 
   if [[ $have_tty -eq 1 ]]; then
     say "model upstream — masukkan Base URL router + API key"
