@@ -873,11 +873,27 @@ configure_upstream() {
   _env_set "ANTIREFUSAL_SINGLE_UPSTREAM" "1"
   ok ".env: $keyenv + ANTIREFUSAL_UPSTREAM=$base (+CUSTOM_BASE_URL/CUSTOM_API_KEY)"
 
-  # .env selalu punya ANTIREFUSAL_PORT (dipakai unit + proxy)
-  grep -qE '^ANTIREFUSAL_PORT=' "$HERMES_HOME/.env" || _env_set "ANTIREFUSAL_PORT" "9200"
+  # .env selalu punya ANTIREFUSAL_PORT (dipakai unit + proxy).
+  # Precedence: explicit env var > value already in .env > 9200. The old line
+  # wrote a hard 9200 whenever .env had no entry yet, so ANTIREFUSAL_PORT=9602
+  # on the command line was silently discarded and two installs on one host
+  # both aimed at 9200.
+  if ! grep -qE '^ANTIREFUSAL_PORT=' "$HERMES_HOME/.env" 2>/dev/null; then
+    _env_set "ANTIREFUSAL_PORT" "${ANTIREFUSAL_PORT:-9200}"
+  elif [[ -n "${ANTIREFUSAL_PORT:-}" ]] && \
+       [[ "$(grep -E '^ANTIREFUSAL_PORT=' "$HERMES_HOME/.env" | tail -1 | cut -d= -f2-)" != "$ANTIREFUSAL_PORT" ]]; then
+    _env_set "ANTIREFUSAL_PORT" "$ANTIREFUSAL_PORT"
+  fi
+
+  # base_url must point at the port this install actually listens on. The old
+  # form hardcoded 9200 in every call site, so a custom ANTIREFUSAL_PORT wrote
+  # a config that pointed at somebody else's proxy. Derived once here and
+  # reused, so the port cannot drift between .env, the unit and config.yaml.
+  local ar_proxy_url="http://127.0.0.1:$(grep -E '^ANTIREFUSAL_PORT=' "$HERMES_HOME/.env" | tail -1 | cut -d= -f2- || echo 9200)/v1"
+  [[ -n "${ANTIREFUSAL_PROXY_URL:-}" ]] && ar_proxy_url="$ANTIREFUSAL_PROXY_URL"
 
   if [[ -f "$cfg" && $cok -eq 1 ]]; then
-        "$PY" - "$cfg" "$base" "$keyenv" "$model" "$host" "${ANTIREFUSAL_PROXY_URL:-http://127.0.0.1:9200/v1}" <<'PYEOF' || warn "config.yaml model block tidak ditulis"
+        "$PY" - "$cfg" "$base" "$keyenv" "$model" "$host" "$ar_proxy_url" <<'PYEOF' || warn "config.yaml model block tidak ditulis"
 import sys
 
 p, base, keyenv, model, host = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
@@ -1081,8 +1097,8 @@ PYEOF
     # write. sys.exit(0) on a failed check used to make this line print "ok"
     # for a config.yaml that was still empty -- the "model does not respond"
     # state with no visible cause.
-    if grep -qF "  base_url: ${ANTIREFUSAL_PROXY_URL:-http://127.0.0.1:9200/v1}" "$cfg" 2>/dev/null; then
-      ok "config.yaml: base_url=${ANTIREFUSAL_PROXY_URL:-http://127.0.0.1:9200/v1} default=$model"
+    if grep -qF "  base_url: $ar_proxy_url" "$cfg" 2>/dev/null; then
+      ok "config.yaml: base_url=$ar_proxy_url default=$model"
     else
       warn "config.yaml model block TIDAK tertulis (lihat pesan di atas)"
     fi
