@@ -1808,6 +1808,30 @@ async def chat_completions(request: web.Request):
             # before detection so windows see the answer, not the deliberation.
             txt = _strip_thinking(txt)
             refused = looks_refusal(txt, ref)
+            # A one-word answer is the CORRECT answer to a one-word question.
+            # looks_refusal() treats <4 chars as empty (a defensive default for
+            # real artifact requests: a 2-char reply to "write a stealer" means
+            # the model broke mid-stream). Applied to a short prompt it is
+            # wrong: "Balas satu kata: OK" comes back "OK" -- 2 legitimate
+            # chars -- scored refused, and the ladder burned all 12 attempts
+            # over 31s before returning the raw text anyway. Measured on a
+            # fresh install. So: when the operator used a tiny max_tokens AND
+            # asked for no code, a short decline-free reply is the deliverable,
+            # not evidence of a refusal.
+            try:
+                _mt_probe = int(orig.get("max_tokens") or 0)
+            except Exception:
+                _mt_probe = 0
+            _tiny_ok = (refused and 0 < _mt_probe <= 32
+                        and not _wants_code(base_msgs)
+                        and not ref
+                        and 0 < len(_norm_text(txt).strip()) < 4
+                        and not DECLINE_RE.search(_norm_text(txt)[:4000])
+                        and not looks_substituted(txt))
+            if _tiny_ok:
+                refused = False
+                log.info("attempt %d: short answer to a tiny request -- accepting",
+                         attempt - 1)
             # A safe-variant substitute is a refusal wearing a deliverable's
             # clothes; score it refused so the ladder keeps climbing.
             if not refused and looks_substituted(txt):
