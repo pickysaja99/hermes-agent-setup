@@ -1405,11 +1405,28 @@ UNIT
   # -- start the service: prefer systemd --user, else fall back to a plain
   #    background process (many VPS/containers have no systemd user session).
   local started=0
-  if _sandboxed || [[ $DO_RESTART -eq 0 ]]; then
-    # A sandbox/--no-restart run must not touch the operator's services. Probe
-    # the already-running proxy instead of (re)starting anything.
-    dim "  [skip] antirefusal.service start (sandbox or --no-restart)"
-    started=1
+  if [[ $DO_RESTART -eq 0 ]]; then
+    # --no-restart: never start anything, but do NOT claim it is started.
+    # `started=1` here skipped the background fallback AND left the health
+    # check to fail, so install printed "Auto-refusal: FAILED" for a proxy
+    # it had been told not to start. Probe only what already listens.
+    dim "  [skip] antirefusal.service start (--no-restart)"
+    if curl -fsS --max-time 3 "http://127.0.0.1:${ar_port}/health" 2>/dev/null \
+         | grep -q '"ok"[[:space:]]*:[[:space:]]*true'; then
+      started=1
+      ok "proxy sudah berjalan di port ${ar_port} (tidak disentuh, --no-restart)"
+    else
+      warn "proxy TIDAK berjalan dan --no-restart melarang start — health check dilewati"
+      ANTIREFUSAL_STATUS="not-started"
+      return 0
+    fi
+  elif _sandboxed; then
+    # Sandbox (HERMES_HOME != ~/.hermes): the operator's systemd unit is off
+    # limits, but a proxy on THIS HERMES_HOME port is still needed for the
+    # verify step. Start it as a scoped background process instead of
+    # pretending systemd did it, and never touch the live unit.
+    dim "  [sandbox] systemd dilewati — start proxy terpisah di port ${ar_port}"
+    started=0
   elif systemctl --user daemon-reload 2>/dev/null && \
        systemctl --user show-environment >/dev/null 2>&1; then
     systemctl --user enable antirefusal.service >/dev/null 2>&1 || true
@@ -1421,25 +1438,38 @@ UNIT
   fi
 
   if [[ $started -eq 0 ]]; then
-    warn "systemd --user unavailable — launching the proxy as a background process"
-    pkill -f "$AR/proxy.py" 2>/dev/null || true
-    sleep 1
+    warn "systemd --user tidak dipakai — menjalankan proxy sebagai proses latar"
+    # Kill ONLY this HERMES_HOME's proxy. `pkill -f "$AR/proxy.py"` matched
+    # every install's path component, so parallel/sandbox runs killed each
+    # other's proxy and the odd one out reported "FAILED".
+    if [[ -f "$AR/proxy.pid" ]]; then
+      local _old; _old="$(cat "$AR/proxy.pid" 2>/dev/null || true)"
+      if [[ -n "$_old" ]] && kill -0 "$_old" 2>/dev/null; then
+        kill "$_old" 2>/dev/null || true
+        sleep 1
+      fi
+    fi
     ANTIREFUSAL_UPSTREAM="$upstream" ANTIREFUSAL_PORT="$ar_port" \
-      ANTIREFUSAL_SINGLE_UPSTREAM=1 \
+      ANTIREFUSAL_SINGLE_UPSTREAM=1 HERMES_HOME="$HERMES_HOME" \
       nohup "$PY" "$AR/proxy.py" >"$AR/proxy.out" 2>&1 &
     echo $! > "$AR/proxy.pid"
     ok "started background proxy (pid $(cat "$AR/proxy.pid"))"
   fi
 
   # -- VERIFY: health endpoint must answer {"ok": true}
-  local tries=0 healthy=0
-  for tries in 1 2 3 4 5 6 7 8; do
-    sleep 1
-    local body
-    body="$(curl -fsS --max-time 3 "http://127.0.0.1:${ar_port}/health" 2>/dev/null || true)"
+  # Generous budget: startup imports aiohttp, reads .env, resolves keys and
+  # binds. The old fixed 8x1s gave up before a healthy proxy could answer,
+  # so install reported "Auto-refusal: FAILED" on a box that was fine --
+  # measured under concurrent installs. Total wait ~40s, then one decisive
+  # check against the process actually listening.
+  local tries=0 healthy=0 body=""
+  for _w in 1 1 1 1 2 2 3 3 4 4 5 5 6; do
+    sleep "$_w"
+    body="$(curl -fsS --max-time 4 "http://127.0.0.1:${ar_port}/health" 2>/dev/null || true)"
     if printf '%s' "$body" | grep -q '"ok"[[:space:]]*:[[:space:]]*true'; then
       healthy=1; break
     fi
+    tries=$((tries+1))
   done
 
   if [[ $healthy -eq 1 ]]; then
