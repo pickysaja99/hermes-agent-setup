@@ -1106,6 +1106,24 @@ PYEOF
 
   local arcfg="$HERMES_HOME/anti-refusal/config.json"
   if [[ -f "$arcfg" ]]; then
+    # max_attempts floor. The shipped config.json carried 8 while the code
+    # default was 12, and CFG wins over the default, so the ladder never got
+    # past 8 on any box that had ever been installed -- every "12 attempts"
+    # claim in the repo was undone by this one file. Raise it in place when it
+    # is below the floor; never lower an operator's larger value.
+    "$PY" - "$arcfg" <<'PYEOF' 2>/dev/null || true
+import json, sys
+p = sys.argv[1]
+try:
+    cfg = json.load(open(p))
+except Exception:
+    sys.exit(0)
+cur = cfg.get("max_attempts")
+if isinstance(cur, int) and cur < 12:
+    cfg["max_attempts"] = 12
+    json.dump(cfg, open(p, "w"), indent=2)
+    print("raised")
+PYEOF
     local mf; mf="$(mktemp)"
     printf '%s\n' "$models" > "$mf"
     # F4: buang SEMUA upstream lama yang router-nya BEDA host dari $host.

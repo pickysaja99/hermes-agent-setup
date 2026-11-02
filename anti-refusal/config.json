@@ -1,6 +1,6 @@
 {
   "port": 9200,
-  "max_attempts": 8,
+  "max_attempts": 12,
   "request_budget_s": 600,
   "upstream_timeout": 75,
   "upstream_connect_timeout": 30,
