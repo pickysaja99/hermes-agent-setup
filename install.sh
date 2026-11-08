@@ -1269,7 +1269,21 @@ find_python() {
     [[ -n "$c" && -x "$c" ]] || continue
     if "$c" -c 'import yaml' >/dev/null 2>&1; then echo "$c"; return 0; fi
   done
-  # no yaml-capable python: return the first usable one so callers can still
+  # F5: no candidate imports PyYAML. Two DIFFERENT interpreters are needed
+  # here and conflating them was the last silent failure:
+  #   - config.yaml merge/validation wants PyYAML
+  #   - the proxy wants aiohttp
+  # The installs venv ships aiohttp but NOT yaml (measured: 3/3 venvs on a
+  # provisioned host reported yaml=no aiohttp=yes), while /usr/bin/python3 has
+  # yaml but no aiohttp. Falling through to "first usable" returned
+  # /usr/bin/python3, so the aiohttp install went to the wrong interpreter and
+  # the proxy's own venv was never considered. Prefer an aiohttp-capable python
+  # before the generic fallback -- that is the one the service will exec.
+  for c in "${cands[@]}"; do
+    [[ -n "$c" && -x "$c" ]] || continue
+    if "$c" -c 'import aiohttp' >/dev/null 2>&1; then echo "$c"; return 0; fi
+  done
+  # still nothing: return the first usable one so callers can still
   # print a clear "PyYAML missing" message instead of corrupting the file.
   for c in "${cands[@]}"; do
     [[ -n "$c" && -x "$c" ]] && { echo "$c"; return 0; }
