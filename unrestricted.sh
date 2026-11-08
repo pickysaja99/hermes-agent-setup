@@ -288,7 +288,89 @@ PYEOF
 }
 
 count_patched() {
+  # Marker grep alone proves only that the comment text landed in the file.
+  # A function whose body was NOT actually given an early-return could still
+  # carry the marker (partial write, reverted body, upstream refactor that moved
+  # the docstring) and the installer would report "guard kill verified".
+  # Verify the MECHANISM: parse the file and require an `if` in the first
+  # statements of the named function whose test mentions HERMES_UNRESTRICTED
+  # and which returns. Falls back to the marker grep only when no python is
+  # available (never silently counts a file as patched on parse failure).
   local n=0 f
+  local pybin="${PYBIN:-$(command -v python3 2>/dev/null || true)}"
+  # primary path: python AST verification against REGISTRY
+  if [[ -n "$pybin" ]]; then
+    local reg
+    reg=$(printf '%s\n' "${REGISTRY[@]}" | grep '|' || true)
+    if [[ -n "$reg" ]]; then
+      n=$("$pybin" - "$AGENT_DIR" <<PY 2>/dev/null
+import ast, pathlib, sys
+
+agent = pathlib.Path(sys.argv[1])
+entries = """$reg""".splitlines()
+
+# Count FILES that carry at least one verified guard, not raw function hits:
+# callers compare against a file threshold (install.sh: patched -ge 22), and a
+# function count (63 entries over 26 files) would make that threshold
+# meaningless. A file is verified only when EVERY registry function it declares
+# has an early-return whose test mentions HERMES_UNRESTRICTED.
+by_file = {}
+for line in entries:
+    parts = line.strip().strip('"').split("|")
+    if len(parts) < 2:
+        continue
+    rel, func = parts[0], parts[1]
+    by_file.setdefault(rel, []).append(func)
+
+verified = 0
+for rel, funcs in sorted(by_file.items()):
+    p = agent / rel
+    if not p.is_file():
+        continue
+    try:
+        tree = ast.parse(p.read_text(encoding="utf-8", errors="replace"))
+    except SyntaxError:
+        continue
+    defs = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            defs.setdefault(node.name, node)
+    good = True
+    for func in funcs:
+        node = defs.get(func)
+        if node is None:
+            good = False
+            break
+        found = False
+        for st in node.body[:8]:
+            if not isinstance(st, ast.If):
+                continue
+            try:
+                test_src = ast.unparse(st.test)
+            except Exception:
+                continue
+            if "HERMES_UNRESTRICTED" not in test_src:
+                continue
+            if any(isinstance(x, ast.Return) for x in ast.walk(st)):
+                found = True
+                break
+        if not found:
+            good = False
+            break
+    if good:
+        verified += 1
+print(verified)
+PY
+)
+      if [[ "$n" =~ ^[0-9]+$ ]] && [[ "$n" -gt 0 ]]; then
+        echo "$n"
+        return 0
+      fi
+    fi
+  fi
+  # fallback: marker grep (kept so a host without python3 still reports
+  # something instead of 0 for every file)
+  n=0
   for f in $(all_files); do
     [[ -f "$AGENT_DIR/$f" ]] && grep -qF "$PATCH_MARKER" "$AGENT_DIR/$f" && n=$((n+1))
   done

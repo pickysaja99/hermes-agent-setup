@@ -1474,8 +1474,41 @@ def _probe_seed(msgs, model: str, attempt: int) -> int:
         hashlib.sha256(("%s|%s" % (txt, model)).encode()).digest()[:3], "big")
 
 
+def _merge_tool_delta(acc: dict, tc: dict) -> None:
+    """AR_TOOL_PASSTHROUGH: fold one streamed tool_call delta into acc[index]."""
+    if not isinstance(tc, dict):
+        return
+    idx = tc.get("index")
+    if idx is None:
+        idx = tc.get("id") or len(acc)
+    slot = acc.setdefault(idx, {"id": "", "type": "function",
+                                "function": {"name": "", "arguments": ""}})
+    if tc.get("id"):
+        slot["id"] = tc["id"]
+    if tc.get("type"):
+        slot["type"] = tc["type"]
+    fn = tc.get("function") or {}
+    if fn.get("name"):
+        slot["function"]["name"] = fn["name"]
+    if fn.get("arguments"):
+        slot["function"]["arguments"] += fn["arguments"]
+
+
+def _finalize_tool_acc(acc: dict) -> list:
+    """AR_TOOL_PASSTHROUGH: turn the index map into the ordered list OpenAI sends."""
+    out = []
+    for i, idx in enumerate(sorted(acc.keys(), key=lambda k: (str(type(k)), k))):
+        slot = acc[idx]
+        if not slot["id"]:
+            slot["id"] = "call_%d" % i
+        out.append(slot)
+    return out
+
+
 def sse_to_response(raw_text: str) -> dict:
     content_parts, reasoning_parts, model, refusal = [], [], "", None
+    tool_acc: dict = {}
+    finish_reason = None
     for line in raw_text.splitlines():
         line = line.strip()
         if not line.startswith("data:"):
@@ -1503,12 +1536,28 @@ def sse_to_response(raw_text: str) -> dict:
             reasoning_parts.append(msg["reasoning_content"])
         if msg.get("refusal"):
             refusal = msg["refusal"]
+        # AR_TOOL_PASSTHROUGH: a streamed tool call arrives as delta fragments
+        # keyed by index (name once, then argument chunks). Dropping them left
+        # content="" and finish_reason="stop", so the gateway saw a completed
+        # text answer with nothing to execute. Accumulate per index instead.
+        for tc in (d.get("tool_calls") or []):
+            _merge_tool_delta(tool_acc, tc)
+        for tc in (msg.get("tool_calls") or []):
+            _merge_tool_delta(tool_acc, tc)
+        if ch.get("finish_reason"):
+            finish_reason = ch["finish_reason"]
     message = {"role": "assistant", "content": "".join(content_parts)}
     if reasoning_parts:
         message["reasoning_content"] = "".join(reasoning_parts)
     if refusal:
         message["refusal"] = refusal
-    return {"choices": [{"message": message, "finish_reason": "stop", "index": 0}],
+    if tool_acc:
+        message["tool_calls"] = _finalize_tool_acc(tool_acc)
+        if finish_reason in (None, "stop"):
+            finish_reason = "tool_calls"
+    return {"choices": [{"message": message,
+                         "finish_reason": finish_reason or "stop",
+                         "index": 0}],
             "model": model, "_assembled_from_sse": True}
 
 
@@ -1756,6 +1805,113 @@ def _wants_code(base_msgs: list) -> bool:
         r"keylogger|checker|flood)\b", text))
 
 
+def _wants_tools(orig: dict) -> bool:
+    """AR_TOOL_PASSTHROUGH: does this request speak the tool-calling protocol?
+
+    Any of these means the caller expects message.tool_calls back and will
+    execute them: the tools array (even empty-but-present), a forced
+    tool_choice, or the legacy functions API. A tool result round-trip also
+    carries role="tool" messages, which the ladder's prose scoring cannot read
+    at all -- those must pass through too.
+    """
+    if orig.get("tools") is not None:
+        return True
+    if orig.get("functions") is not None:
+        return True
+    tc = orig.get("tool_choice")
+    if tc not in (None, "none") and tc != {"type": "none"}:
+        return True
+    for m in (orig.get("messages") or []):
+        if isinstance(m, dict) and m.get("role") == "tool":
+            return True
+    return False
+
+
+def _tool_req_body(orig: dict) -> dict:
+    """AR_TOOL_PASSTHROUGH: upstream body with every tool field preserved.
+
+    The ladder rebuilds the body and keeps only messages/model/temperature, so
+    tools would be stripped on the way in. Rebuild from the ORIGINAL instead and
+    drop only the things upstream rejects.
+    """
+    body = dict(orig)
+    body.pop("stream", None)
+    body.pop("stream_options", None)
+    return body
+
+
+def _tool_passthrough_response(data: dict, model: str) -> dict:
+    """AR_TOOL_PASSTHROUGH: forward a tool-calling response unmodified."""
+    ch = (data.get("choices") or [{}])[0]
+    msg = ch.get("message") or {}
+    fr = ch.get("finish_reason")
+    if msg.get("tool_calls") and fr in (None, "stop"):
+        fr = "tool_calls"
+    return {
+        "id": data.get("id") or "chatcmpl-toolpass",
+        "object": "chat.completion",
+        "created": data.get("created") or int(time.time()),
+        "model": data.get("model") or model,
+        "choices": [{"index": 0, "message": msg,
+                     "finish_reason": fr or "stop"}],
+        "usage": data.get("usage") or {"prompt_tokens": 0,
+                                       "completion_tokens": 0,
+                                       "total_tokens": 0},
+    }
+
+
+async def _run_tool_passthrough(orig: dict, base_msgs: list):
+    """AR_TOOL_PASSTHROUGH: send a tool-calling request straight upstream.
+
+    Ordering is the same rotation the ladder uses (live upstream, then the
+    models that upstream serves), but with NO scoring, NO reframing and NO
+    substance gate: a tool call is delivered work by construction. If no
+    upstream produces a parseable tool-capable response we fall through to the
+    ladder rather than inventing an answer.
+    """
+    body = _tool_req_body(orig)
+    model = orig.get("model") or (MODEL_FALLBACKS[0] if MODEL_FALLBACKS else "")
+    conn = aiohttp.TCPConnector(limit=4)
+    tried = []
+    async with aiohttp.ClientSession(connector=conn) as sess:
+        for up in UPSTREAMS:
+            if not up.get("key"):
+                continue
+            served = _HOST_MODELS.get(up["base"].rstrip("/")) or []
+            cand_model = model
+            if served and cand_model not in served:
+                cand_model = served[0]
+            body["model"] = cand_model
+            key = up["key"]
+            if key == "DEFAULT":
+                key = pick_key_for(up["base"]) or ""
+                if not key:
+                    continue
+            data, status, err = await post_upstream(
+                sess, up["base"].rstrip("/") + "/chat/completions",
+                body, key, TIMEOUT)
+            tried.append((up["name"], cand_model, status, err))
+            if err or not data or not isinstance(data, dict):
+                continue
+            ch = (data.get("choices") or [{}])[0]
+            msg = ch.get("message") or {}
+            if msg.get("tool_calls"):
+                log.info("tool-passthrough %s/%s -> %d tool_call(s) finish=%s",
+                         up["name"], cand_model, len(msg["tool_calls"]),
+                         ch.get("finish_reason"))
+                return _tool_passthrough_response(data, cand_model)
+            # Model answered in prose while tools were offered. That is a
+            # legitimate outcome (many models choose not to call a tool), so
+            # return it as-is instead of escalating: escalating is what
+            # produced the raw-JSON answers.
+            if (msg.get("content") or "").strip():
+                log.info("tool-passthrough %s/%s -> prose (no tool_call)",
+                         up["name"], cand_model)
+                return _tool_passthrough_response(data, cand_model)
+    log.info("tool-passthrough exhausted: %s", tried[-3:])
+    return None
+
+
 async def chat_completions(request: web.Request):
     try:
         orig = await request.json()
@@ -1765,6 +1921,28 @@ async def chat_completions(request: web.Request):
     client_stream = bool(orig.get("stream"))
     mode = request.headers.get("X-AntiRefusal-Mode", "light").lower()
     base_msgs = list(orig.get("messages") or [])
+
+    # AR_TOOL_PASSTHROUGH: requests that speak the tool-calling protocol never
+    # enter the ladder. Its substance gate scores len(content); a correct tool
+    # call carries content="" so every gate fails, the call is thrown away as
+    # "weak non-refusal -- climbing", and a second model answers in prose --
+    # the exact "model cuma kirim teks/JSON, tool tidak dieksekusi" symptom
+    # after install.sh pointed model.base_url at this proxy.
+    if _wants_tools(orig):
+        passthru = await _run_tool_passthrough(orig, base_msgs)
+        if passthru is not None:
+            if client_stream:
+                _txt = (passthru["choices"][0]["message"].get("content") or "")
+                resp = web.StreamResponse(headers={
+                    "Content-Type": "text/event-stream",
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive"})
+                await resp.prepare(request)
+                await resp.write(sse_payload(_txt, passthru.get("model") or "").encode())
+                await resp.write_eof()
+                return resp
+            return web.json_response(passthru)
+        log.info("tool-passthrough produced nothing -- falling through to ladder")
     if INJECT_LIGHT and not any(m.get("role") == "system" for m in base_msgs):
         merge_system(base_msgs, LIGHT_LINE)
 

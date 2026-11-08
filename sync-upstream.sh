@@ -148,7 +148,7 @@ if [[ $DRY -eq 1 ]]; then
   say "(dry-run) akan:"
   say "  .env ANTIREFUSAL_UPSTREAM = $NORM_CUR"
   say "  .env ANTIREFUSAL_MODEL    = $CUR_MODEL"
-  [[ -n "$KEYENV" ]] && say "  .env CUSTOM_BASE_URL      = $NORM_CUR"
+  say "  .env CUSTOM_BASE_URL      = $NORM_PROXY"
   say "  config.yaml model.base_url = $NORM_PROXY"
   exit 0
 fi
@@ -175,7 +175,13 @@ set_env() {  # key value
 
 set_env "ANTIREFUSAL_UPSTREAM" "$NORM_CUR"
 set_env "ANTIREFUSAL_MODEL" "$CUR_MODEL"
-[[ -n "$KEYENV" ]] && set_env "CUSTOM_BASE_URL" "$NORM_CUR"
+# CUSTOM_BASE_URL is what HERMES dials, not what the proxy dials. Hermes
+# resolves explicit > CUSTOM_BASE_URL > model.base_url
+# (hermes_cli/runtime_provider_backends.py:120), so writing the router here
+# put the gateway straight onto the router and skipped the ladder -- the
+# proxy stayed green on 9200 while every request 400'd upstream. The router
+# belongs in ANTIREFUSAL_UPSTREAM only; CUSTOM_BASE_URL must be the proxy.
+set_env "CUSTOM_BASE_URL" "$NORM_PROXY"
 chmod 600 "$ENVF" 2>/dev/null || true
 ok ".env diperbarui (ANTIREFUSAL_UPSTREAM, ANTIREFUSAL_MODEL)"
 

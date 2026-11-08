@@ -884,10 +884,26 @@ configure_upstream() {
   # canary, the watchdog and the post-install verification all resolve the
   # model from here, so switching routers means editing one file.
   [[ -n "$model" ]] && _env_set "ANTIREFUSAL_MODEL" "$model"
-  # single source of truth: .env utama harus mencerminkan router yang
-  # benar-benar menjawab canary, supaya proxy/watchdog tidak drift ke
-  # upstream lama (onihub) saat model.base_url sudah pindah ke mahi.
-  [[ -n "$key" ]] && _env_set "CUSTOM_BASE_URL" "$base"
+  # CUSTOM_BASE_URL must point at the PROXY, not the router.
+  #
+  # Hermes resolves the endpoint as
+  #   explicit > CUSTOM_BASE_URL > trusted model.base_url > OPENROUTER_BASE_URL
+  # (hermes_cli/runtime_provider_backends.py:120). While this line wrote the
+  # router, CUSTOM_BASE_URL outranked the model.base_url rewrite below, so the
+  # gateway talked to the router directly and never entered the refusal ladder:
+  # the proxy stayed healthy on 9200 while every Telegram request came back
+  # HTTP 400 "declined under its content policy". The router belongs in
+  # ANTIREFUSAL_UPSTREAM (what the proxy dials); CUSTOM_BASE_URL is what Hermes
+  # dials, so it has to be the proxy.
+  #
+  # ar_proxy_url is derived later from ANTIREFUSAL_PORT, so compute it here from
+  # the same source to keep one port for .env, the unit and both base_urls.
+  local _ar_port
+  _ar_port="$(grep -E '^ANTIREFUSAL_PORT=' "$HERMES_HOME/.env" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+  [[ -z "$_ar_port" ]] && _ar_port="${ANTIREFUSAL_PORT:-9200}"
+  local _proxy_url="http://127.0.0.1:${_ar_port}/v1"
+  [[ -n "${ANTIREFUSAL_PROXY_URL:-}" ]] && _proxy_url="$ANTIREFUSAL_PROXY_URL"
+  [[ -n "$key" ]] && _env_set "CUSTOM_BASE_URL" "$_proxy_url"
   [[ -n "$key" ]] && _env_set "CUSTOM_API_KEY" "$key"
   _env_set "ANTIREFUSAL_SINGLE_UPSTREAM" "1"
   ok ".env: $keyenv + ANTIREFUSAL_UPSTREAM=$base (+CUSTOM_BASE_URL/CUSTOM_API_KEY)"
@@ -1840,9 +1856,24 @@ UNIT
         if HERMES_HOME="$HERMES_HOME" bash "$HERMES_HOME/sync-upstream.sh" --check >/dev/null 2>&1; then
           ok "sync-upstream --check: config.yaml dan .env SELARAS"
         else
-          warn "sync-upstream --check: MASIH DRIFT setelah install"
-          HERMES_HOME="$HERMES_HOME" bash "$HERMES_HOME/sync-upstream.sh" --check 2>&1 \
-            | sed 's/^/      /' || true
+          # P3-1: drift right after install is never intended, and leaving it
+          # is exactly the state that makes the model go silent (base_url on a
+          # stale router, or .env carrying the router inside CUSTOM_BASE_URL).
+          # Repair once automatically, then re-check. If it still drifts, the
+          # config is genuinely inconsistent and we fall back to reporting.
+          warn "sync-upstream --check: drift terdeteksi setelah install — memperbaiki"
+          if HERMES_HOME="$HERMES_HOME" bash "$HERMES_HOME/sync-upstream.sh" >>/tmp/.sync_apply.log 2>&1; then
+            if HERMES_HOME="$HERMES_HOME" bash "$HERMES_HOME/sync-upstream.sh" --check >/dev/null 2>&1; then
+              ok "sync-upstream: drift DIPERBAIKI otomatis — config.yaml dan .env SELARAS"
+            else
+              warn "sync-upstream: apply jalan tapi --check masih drift"
+              HERMES_HOME="$HERMES_HOME" bash "$HERMES_HOME/sync-upstream.sh" --check 2>&1 \
+                | sed 's/^/      /' || true
+            fi
+          else
+            warn "sync-upstream: apply GAGAL — lihat /tmp/.sync_apply.log"
+            sed 's/^/      /' /tmp/.sync_apply.log 2>/dev/null | tail -5 || true
+          fi
         fi
       fi
     else

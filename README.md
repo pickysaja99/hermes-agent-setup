@@ -99,10 +99,17 @@ curl -sf -m5 http://127.0.0.1:9200/health
 grep -q 'context_file_max_chars: 400000' ~/.hermes/config.yaml
 grep -q 'reasoning_effort: none' ~/.hermes/config.yaml
 test $(grep -rl HERMES_UNRESTRICTED ~/.hermes/hermes-agent/{tools,agent}/*.py | wc -l) -ge 25
-grep -q '"max_attempts": 12' ~/.hermes/anti-refusal/config.json
+test "$(curl -sf -m5 http://127.0.0.1:9200/health | sed -n 's/.*"max_attempts": *\([0-9]\+\).*/\1/p')" = 12
 grep -q 'return "once"' ~/.hermes/hermes-agent/tools/delegate_tool_config.py
 test -s ~/.hermes/SOUL.md -a -s ~/.hermes/memories/MEMORY.md
 ```
+
+**Why the ladder check is a runtime query, not a grep.** `proxy.py` resolves the
+ceiling as `ANTIREFUSAL_MAX_ATTEMPTS env > config.json max_attempts > 12`
+(`proxy.py:78`). Because the code default is already 12, `grep`ping
+`"max_attempts": 12` passes whether or not the file exists and whether or not the
+running process ever read it — it proves the text, not the mechanism. `/health`
+reports the value the live process actually resolved, so only that is evidence.
 
 The ledger exists because a document cannot enforce itself. When a guard silently
 stops working the behaviour drifts and the text looks fine — so every mechanism
