@@ -1124,6 +1124,16 @@ PYEOF
   fi
 
   local arcfg="$HERMES_HOME/anti-refusal/config.json"
+  # F6: on a FRESH install this file does not exist -- the code copy above
+  # deliberately skips config.json so a re-install never clobbers a live one.
+  # Nothing else created it, so §0b mechanism #7 ("max_attempts": 12 in
+  # config.json) was silently absent on every brand-new box: load_cfg() falls
+  # back to {} and the ledger check has nothing to read. Seed it from the repo
+  # template ONLY when missing -- an existing file is never touched here.
+  if [[ ! -f "$arcfg" && -f "$WORKDIR/repo/anti-refusal/config.json" ]]; then
+    run cp -a "$WORKDIR/repo/anti-refusal/config.json" "$arcfg"
+    ok "anti-refusal/config.json seeded from template (fresh install)"
+  fi
   if [[ -f "$arcfg" ]]; then
     # max_attempts floor. The shipped config.json carried 8 while the code
     # default was 12, and CFG wins over the default, so the ladder never got
