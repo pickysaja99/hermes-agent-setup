@@ -554,6 +554,15 @@ _env_get() {  # key -> value from .env (empty when unset)
 _env_set() {  # key value — replace the line in place, else append
   local k="$1" v="$2" f="$HERMES_HOME/.env" tmp
   [[ -f "$f" ]] || touch "$f"
+  # F4 guard: a newline in the value would emit one KEY= line followed by raw
+  # text, which systemd's EnvironmentFile rejects ("Ignoring invalid
+  # environment assignment") and the unit crash-loops. Refuse instead of
+  # silently corrupting .env — this is the second line of defence behind the
+  # stderr fix in _select_model.
+  if [[ "$v" == *$'\n'* || "$v" == *$'\r'* ]]; then
+    warn "_env_set: refusing multi-line value for $k (first line: ${v%%$'\n'*})"
+    return 1
+  fi
   # F3: jangan timpa nilai lama yang VALID dengan string kosong. Cacat lama:
   # _env_set KEY "" menghapus CUSTOM_API_KEY/CUSTOM_BASE_URL yang terisi.
   if [[ -z "$v" ]] && grep -qE "^${k}=..+" "$f"; then
@@ -663,16 +672,26 @@ _select_model() {  # models_list want -> chosen model id
   for m in "${clean[@]}"; do
     if [[ -n "$want" && "$m" == "$want" ]]; then def="$want"; break; fi
   done
-  printf '   model tersedia:\n'
+  # F4: every UI line goes to STDERR. This function is called as
+  #   model="$(_select_model ...)"
+  # so anything printed to stdout is captured into $model. It used to print the
+  # whole menu to stdout and $model became the 15-line menu text plus the prompt,
+  # which _env_set then wrote verbatim into .env as
+  #   ANTIREFUSAL_MODEL=   model tersedia:
+  #   1) ...
+  # → systemd rejected the file ("invalid environment assignment"), the
+  # antirefusal unit crash-looped, and every request died with HTTP 400 from
+  # the router. Only the RETURNED selection may reach stdout.
+  printf '   model tersedia:\n' >&2
   local idx=0 marker
   for m in "${clean[@]}"; do
     idx=$((idx + 1))
     marker=""
     [[ "$m" == "$def" ]] && marker="   <- default"
-    printf '   %2d) %s%s\n' "$idx" "$m" "$marker"
+    printf '   %2d) %s%s\n' "$idx" "$m" "$marker" >&2
   done
   local choice=""
-  printf '   pilih model (nomor / ID manual, Enter = %s): ' "$def"
+  printf '   pilih model (nomor / ID manual, Enter = %s): ' "$def" >&2
   IFS= read -r choice </dev/tty 2>/dev/null || true
   if [[ -z "$choice" ]]; then
     printf '%s' "$def"
@@ -1235,6 +1254,16 @@ find_python() {
   for t in "$HOME"/.hermes/tools/python*/bin/python3; do
     [[ -x "$t" ]] && cands+=("$t")
   done
+  # F1: the venv this machine actually RUNS the proxy with lives under
+  # ~/.hermes/installs/<id>/environments/<id>/venv — NOT at
+  # ~/.hermes/hermes-agent/venv (that path does not exist on an
+  # installer-provisioned host). It is the only python that reliably has
+  # aiohttp, and antirefusal.service already resolves it via this same glob.
+  # Without it $PY fell through to /usr/bin/python3 (no aiohttp on Ubuntu
+  # 24.04) and the installer installed deps into a python the proxy never uses.
+  for t in "$HOME"/.hermes/installs/*/environments/*/venv/bin/python3; do
+    [[ -x "$t" ]] && cands+=("$t")
+  done
   local c
   for c in "${cands[@]}"; do
     [[ -n "$c" && -x "$c" ]] || continue
@@ -1387,13 +1416,25 @@ activate_antirefusal() {
     return 0
   fi
 
-  # python deps for the proxy (best-effort; do not fail the install on pip)
-  "$PY" -c "import aiohttp" 2>/dev/null || {
-    say "installing aiohttp for the proxy"
+  # python deps for the proxy. F3: this used to end in `warn` and return 0, so
+  # an install that could not provide aiohttp still reported success while the
+  # proxy could never start. Verify AFTER installing and fail the step loudly.
+  local aio_ok=0
+  if "$PY" -c "import aiohttp" 2>/dev/null; then
+    aio_ok=1
+  else
+    say "installing aiohttp for the proxy ($PY)"
     "$PY" -m pip install --quiet aiohttp 2>/dev/null || \
-      "$PY" -m pip install --quiet --user aiohttp 2>/dev/null || \
-      warn "could not pip install aiohttp — proxy may not start"
-  }
+      "$PY" -m pip install --quiet --user aiohttp 2>/dev/null || true
+    if "$PY" -c "import aiohttp" 2>/dev/null; then
+      aio_ok=1
+    else
+      warn "aiohttp is NOT importable from $PY — antirefusal cannot start with this interpreter"
+    fi
+  fi
+  if [[ $aio_ok -eq 1 ]]; then
+    ok "aiohttp present in $PY"
+  fi
 
   # -- install a PORTABLE user unit (rewrite ExecStart/WorkingDirectory to this host)
   #
@@ -1447,13 +1488,22 @@ UNIT
   # v6: the portable anti-refusal unit falls back to system python3 when no
   # venv exists, so system python3 needs aiohttp too (Ubuntu 24.04 system
   # python has no pip -- use --break-system-packages or apt).
-  if [[ "$PY" != "/usr/bin/python3" && "$PY" != "/usr/bin/python" ]]; then
+  #
+  # F2: this used to be guarded by `$PY != /usr/bin/python3`, which meant that
+  # on exactly the hosts that NEED the fallback (no hermes-agent/venv → $PY IS
+  # /usr/bin/python3) the block was skipped entirely and system python stayed
+  # without aiohttp. The unit resolves the venv first and only falls back to
+  # /usr/bin/python3, so system python must always be able to import it.
+  if ! /usr/bin/python3 -c "import aiohttp" 2>/dev/null; then
+    say "installing aiohttp for system python3 (proxy fallback path)"
+    /usr/bin/python3 -m pip install --quiet --break-system-packages aiohttp 2>/dev/null || \
+      (sudo -n apt-get install -y -qq python3-aiohttp >/dev/null 2>&1 || \
+       apt-get install -y -qq python3-aiohttp >/dev/null 2>&1) || \
+      warn "system python3 lacks aiohttp -- the venv python must carry it"
     if ! /usr/bin/python3 -c "import aiohttp" 2>/dev/null; then
-      say "installing aiohttp for system python3 (proxy fallback path)"
-      /usr/bin/python3 -m pip install --quiet --break-system-packages aiohttp 2>/dev/null || \
-        (sudo -n apt-get install -y -qq python3-aiohttp >/dev/null 2>&1 || \
-         apt-get install -y -qq python3-aiohttp >/dev/null 2>&1) || \
-        warn "system python3 lacks aiohttp -- proxy will rely on the venv python"
+      warn "system python3 STILL lacks aiohttp — if the venv python is missing too, antirefusal will not start"
+    else
+      ok "system python3 can import aiohttp (fallback path ready)"
     fi
   fi
 
