@@ -596,7 +596,8 @@ route_model_default() {  # $1 = config path
   local cfg="${1:-$HERMES_HOME/config.yaml}" m=""
   m="$(_env_get ANTIREFUSAL_MODEL)"
   if [[ -z "$m" ]]; then
-    # providers.custom.model tracks the router that install.sh last wired.
+    # providers.custom.model tracks the live route's model (the proxy route
+  # carries the same model the router was wired with).
     m="$(sed -n '/^  custom:/,/^  [a-z_]*:[[:space:]]*$/p' "$cfg" 2>/dev/null \
          | grep -m1 -E '^    model:' \
          | sed -E "s/^    model:[[:space:]]*//; s/^'//; s/'$//; s/^\"//; s/\"$//" || true)"
@@ -991,15 +992,20 @@ if not isinstance(mdl, dict):
 # model.base_url is the PROXY, never the router. Hermes must traverse the
 # refusal ladder on every request; pointing it at the upstream directly is
 # how the live box ended up on api.river.ai with the guardrail idle. The
-# router itself is recorded in providers.custom / custom_providers below and
-# in .env (ANTIREFUSAL_UPSTREAM), which is what the proxy reads.
+# router itself is recorded in .env (ANTIREFUSAL_UPSTREAM) and in
+# custom_providers below; providers.custom.base_url must ALSO be the proxy,
+# because the runtime routes live requests through the named provider entry,
+# not through model.base_url (verified: providers.custom.base_url=router
+# bypasses the ladder and the upstream content filter 400s the request).
 mdl["base_url"] = quote(proxy_url)
 mdl["api_key"] = "${%s}" % keyenv
 mdl["default"] = quote(model)
 mdl["provider"] = "custom"
 mdl["api_mode"] = "chat_completions"
 
-# providers.custom mirrors the router; every other provider is preserved.
+# providers.custom is the live ROUTE: its base_url must be the proxy. The
+# external router is kept only in custom_providers (registry) and in .env
+# ANTIREFUSAL_UPSTREAM, which is what the proxy dials.
 prov = doc.get("providers")
 if not isinstance(prov, dict):
     prov = {}
@@ -1011,7 +1017,7 @@ if not isinstance(custom, dict):
 # check that ran afterwards could never see the drift it is meant to report.
 _prev_custom = dict(custom)
 custom.update({
-    "base_url": base,
+    "base_url": proxy_url,
     "api_key": "${%s}" % keyenv,
     "key_env": keyenv,
     "api_mode": "chat_completions",
@@ -1066,7 +1072,10 @@ def _check():
     for u in sorted(set(dup_url)):
         problems.append("duplicate base_url inside custom_providers: %s" % u)
 
-    # 2) every registry entry must have an owning key_env and a route peer
+    # 2) every registry entry must have an owning key_env and a route peer.
+    #    A peer is either a providers.* block with the SAME external URL, or
+    #    (for the live custom route) the local proxy loopback that carries the
+    #    same key_env -- the router is dialed by the proxy, not by Hermes.
     for e in cps:
         u = _norm(e.get("base_url"))
         nm = e.get("name")
@@ -1076,9 +1085,18 @@ def _check():
             problems.append("custom_providers[%s] has no key_env (key cannot resolve)" % nm)
         peers = by_url.get(u) or []
         if not peers:
-            problems.append("custom_providers[%s] (%s) has no providers.* peer "
-                            "-- route definition missing" % (nm, u))
-            continue
+            # fall back to the proxy-routed peer: providers.custom with a local
+            # loopback base_url sharing the same key_env is a valid stand-in.
+            proxy_peer = []
+            for pname, pc in prov2.items():
+                if _norm(pc.get("base_url", "")).startswith("http://127.0.0.1:") and \
+                   str(pc.get("key_env") or "").strip() == str(e.get("key_env") or "").strip():
+                    proxy_peer.append((pname, pc))
+            if not proxy_peer:
+                problems.append("custom_providers[%s] (%s) has no providers.* peer "
+                                "-- route definition missing" % (nm, u))
+                continue
+            peers = proxy_peer
         # 3) base_url peers must agree on key_env, else the route reads another
         #    endpoint's key. THIS is the 401 class fixed in b863cf2.
         want_key = str(e.get("key_env") or "").strip()
@@ -1754,7 +1772,7 @@ PYEOF
     #    written config back and require it to name the proxy, then send one
     #    chat through the exact base_url Hermes will use.
     if [[ -f "$cfg" ]]; then
-      local routed_base
+      local routed_base routed_custom
       routed_base="$("$PY" - "$cfg" <<'PYEOF' 2>/dev/null || true
 import sys
 try:
@@ -1765,13 +1783,39 @@ except Exception:
     print("")
 PYEOF
 )"
+      routed_custom="$("$PY" - "$cfg" <<'PYEOF' 2>/dev/null || true
+import sys
+try:
+    import yaml
+    doc = yaml.safe_load(open(sys.argv[1], encoding="utf-8").read()) or {}
+    print((doc.get("providers") or {}).get("custom", {}).get("base_url") or "")
+except Exception:
+    print("")
+PYEOF
+)"
       routed_base="${routed_base%/}"
+      routed_custom="${routed_custom%/}"
+      local ok_model=0 ok_custom=0
       if [[ -z "$routed_base" ]]; then
         warn "VERIFIKASI: model.base_url tidak terbaca — jalur proxy TIDAK terbukti"
       elif [[ "$routed_base" != "http://127.0.0.1:${ar_port}/v1" ]]; then
         warn "VERIFIKASI GAGAL: model.base_url = $routed_base (bukan proxy 127.0.0.1:${ar_port})"
         warn "  semua permintaan Hermes melewati guardrail: TIDAK. Perbaiki sebelum dipakai."
       else
+        ok_model=1
+        # empty custom route base_url (never set) is fine: runtime falls back to
+        # model.base_url. Non-empty must match the proxy, else the live route
+        # bypasses the ladder (verified: providers.custom.base_url=router 400s).
+        if [[ -z "$routed_custom" ]]; then
+          ok_custom=1
+        elif [[ "$routed_custom" == "http://127.0.0.1:${ar_port}/v1" ]]; then
+          ok_custom=1
+        else
+          warn "VERIFIKASI GAGAL: providers.custom.base_url = $routed_custom (bukan proxy)"
+          warn "  route runtime akan bypass guardrail — perbaiki providers.custom.base_url."
+        fi
+      fi
+      if [[ $ok_model -eq 1 && $ok_custom -eq 1 ]]; then
         # Path is right; now prove a real completion round-trips through it.
         local vmodel vbody vok=0
         vmodel="$(route_model_default "$cfg")"
