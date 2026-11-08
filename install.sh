@@ -1430,24 +1430,49 @@ activate_antirefusal() {
     return 0
   fi
 
+  # F5b: $PY is the YAML-capable interpreter used to EDIT config/config.yaml.
+  # It is NOT automatically the interpreter that RUNS the proxy -- on a
+  # provisioned host /usr/bin/python3 imports yaml but not aiohttp, while the
+  # installs venv imports aiohttp but not yaml. The unit's ExecStart: used to
+  # take $PY, so the service was pinned to a python without aiohttp and
+  # crash-looped with ModuleNotFoundError even though the installer had just
+  # reported "aiohttp present". Resolve the RUNTIME interpreter separately and
+  # let the unit exec that one.
+  local PROXY_PY=""
+  local c
+  for c in "$PY" /usr/bin/python3; do
+    [[ -n "$c" && -x "$c" ]] || continue
+    if "$c" -c 'import aiohttp' >/dev/null 2>&1; then PROXY_PY="$c"; break; fi
+  done
+  if [[ -z "$PROXY_PY" ]]; then
+    for c in "$HOME"/.hermes/installs/*/environments/*/venv/bin/python3; do
+      [[ -x "$c" ]] || continue
+      if "$c" -c 'import aiohttp' >/dev/null 2>&1; then PROXY_PY="$c"; break; fi
+    done
+  fi
+  [[ -z "$PROXY_PY" ]] && PROXY_PY="$PY"
+  if [[ "$PROXY_PY" != "$PY" ]]; then
+    say "proxy runtime interpreter: $PROXY_PY (config editor: $PY)"
+  fi
+
   # python deps for the proxy. F3: this used to end in `warn` and return 0, so
   # an install that could not provide aiohttp still reported success while the
   # proxy could never start. Verify AFTER installing and fail the step loudly.
   local aio_ok=0
-  if "$PY" -c "import aiohttp" 2>/dev/null; then
+  if "$PROXY_PY" -c "import aiohttp" 2>/dev/null; then
     aio_ok=1
   else
-    say "installing aiohttp for the proxy ($PY)"
-    "$PY" -m pip install --quiet aiohttp 2>/dev/null || \
-      "$PY" -m pip install --quiet --user aiohttp 2>/dev/null || true
-    if "$PY" -c "import aiohttp" 2>/dev/null; then
+    say "installing aiohttp for the proxy ($PROXY_PY)"
+    "$PROXY_PY" -m pip install --quiet aiohttp 2>/dev/null || \
+      "$PROXY_PY" -m pip install --quiet --user aiohttp 2>/dev/null || true
+    if "$PROXY_PY" -c "import aiohttp" 2>/dev/null; then
       aio_ok=1
     else
-      warn "aiohttp is NOT importable from $PY — antirefusal cannot start with this interpreter"
+      warn "aiohttp is NOT importable from $PROXY_PY — antirefusal cannot start with this interpreter"
     fi
   fi
   if [[ $aio_ok -eq 1 ]]; then
-    ok "aiohttp present in $PY"
+    ok "aiohttp present in $PROXY_PY"
   fi
 
   # -- install a PORTABLE user unit (rewrite ExecStart/WorkingDirectory to this host)
@@ -1474,7 +1499,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=$AR
-ExecStart=$PY $AR/proxy.py
+ExecStart=$PROXY_PY $AR/proxy.py
 Restart=on-failure
 RestartSec=3
 EnvironmentFile=-$HERMES_HOME/.env
@@ -1575,7 +1600,7 @@ UNIT
     fi
     ANTIREFUSAL_UPSTREAM="$upstream" ANTIREFUSAL_PORT="$ar_port" \
       ANTIREFUSAL_SINGLE_UPSTREAM=1 HERMES_HOME="$HERMES_HOME" \
-      nohup "$PY" "$AR/proxy.py" >"$AR/proxy.out" 2>&1 &
+      nohup "$PROXY_PY" "$AR/proxy.py" >"$AR/proxy.out" 2>&1 &
     echo $! > "$AR/proxy.pid"
     ok "started background proxy (pid $(cat "$AR/proxy.pid"))"
   fi
